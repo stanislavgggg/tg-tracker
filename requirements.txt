@@ -1,5 +1,4 @@
-aiogram 
-aio 
-http 
-gspread 
+aiogram
+aiohttp
+gspread
 google-auth
