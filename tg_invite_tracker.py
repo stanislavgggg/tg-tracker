@@ -34,9 +34,11 @@ Env-переменные (Railway -> Variables):
                                      ссылку под читаемым именем (переименует и прошлые события)
     /links                           — все ссылки по каналам
     /stats [дней]                    — сводка по каналам и ссылкам
+    /members                         — общее число подписчиков в каждом канале
     /today                           — сводка за сегодня прямо в чат
-    /report                          — отчёт за вчера (Slack + Sheets)
+    /report                          — отчёт за вчера (Slack + Sheets + снапшот Members)
     /report today                    — сводка за сегодня в Slack
+    /report 7d | 30d | 90d           — агрегат за последние N дней в Slack
     /report 2026-07-19               — отчёт за конкретную дату (Slack + Sheets)
 
 Периодический intraday-отчёт: env INTRADAY_HOURS=2 -> каждые 2 часа
@@ -192,7 +194,7 @@ async def post_to_slack(text: str):
 
 
 # ---------- Google Sheets ----------
-def _sheets_append_sync(rows: list[list]):
+def _sheets_append_sync(tab: str, header: list[str], rows: list[list]):
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -206,26 +208,39 @@ def _sheets_append_sync(rows: list[list]):
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(GSHEET_ID)
     try:
-        ws = sh.worksheet(SHEET_TAB)
+        ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(SHEET_TAB, rows=1000, cols=10)
-        ws.append_row(["date", "channel", "link_name", "joins", "leaves", "net", "requests"],
-                      value_input_option="RAW")
+        ws = sh.add_worksheet(tab, rows=1000, cols=10)
+        ws.append_row(header, value_input_option="RAW")
     ws.append_rows(rows, value_input_option="RAW")
 
 
-async def export_to_sheets(rows: list[list]):
+async def export_to_sheets(rows: list[list], tab: str | None = None,
+                           header: list[str] | None = None):
     if not GSHEET_ID:
         log.info("GSHEET_ID not configured, skipping")
         return
+    tab = tab or SHEET_TAB
+    header = header or ["date", "channel", "link_name", "joins", "leaves", "net", "requests"]
     try:
-        await asyncio.to_thread(_sheets_append_sync, rows)
-        log.info("Sheets: appended %d rows", len(rows))
+        await asyncio.to_thread(_sheets_append_sync, tab, header, rows)
+        log.info("Sheets [%s]: appended %d rows", tab, len(rows))
     except Exception as e:
         log.warning("Sheets export failed: %s", e)
 
 
 # ---------- Report rendering ----------
+async def get_member_counts() -> dict[int, int]:
+    """Current total subscriber count per tracked channel (live from Telegram)."""
+    counts = {}
+    for cid in CHANNEL_IDS:
+        try:
+            counts[cid] = await bot.get_chat_member_count(cid)
+        except Exception as e:
+            log.warning("Member count failed for %s: %s", cid, e)
+    return counts
+
+
 def short_link_label(name: str) -> str:
     """Named links stay as-is; unnamed raw URLs get truncated with a marker."""
     if name.startswith("https://t.me/"):
@@ -233,12 +248,13 @@ def short_link_label(name: str) -> str:
     return name
 
 
-def render_report(rows, title: str) -> str:
+def render_report(rows, title: str, member_counts: dict[int, int] | None = None) -> str:
     """Slack message: per-channel monospace tables + grand total."""
-    if not rows:
-        return f"*{title}*\nNo events recorded in this period."
-
+    member_counts = member_counts or {}
     lines = [f"*{title}*"]
+
+    if not rows:
+        lines.append("No join/leave events recorded in this period.")
     by_chat: dict[int, list] = {}
     for r in rows:
         by_chat.setdefault(r["chat_id"], []).append(r)
@@ -250,8 +266,10 @@ def render_report(rows, title: str) -> str:
         c_req = sum(r["requests"] or 0 for r in chat_rows)
         total_j, total_l, total_req = total_j + c_j, total_l + c_l, total_req + c_req
 
+        members = member_counts.get(chat_id)
+        members_str = f" · members now: {members:,}" if members is not None else ""
         lines.append(f"\n:loudspeaker: *{chan_label(chat_id)}* — "
-                     f"joins {c_j}, left {c_l}, net {c_j - c_l:+d}")
+                     f"joins {c_j}, left {c_l}, net {c_j - c_l:+d}{members_str}")
         name_w = max([len(short_link_label(r["link_name"])) for r in chat_rows] + [4])
         table = [f"{'link'.ljust(name_w)}  joins  left   net"]
         for r in chat_rows:
@@ -260,9 +278,18 @@ def render_report(rows, title: str) -> str:
                          f"  {str(j).rjust(5)}  {str(l).rjust(4)}  {f'{j - l:+d}'.rjust(4)}")
         lines.append("```" + "\n".join(table) + "```")
 
-    lines.append(f"*TOTAL: joins {total_j}, left {total_l}, "
-                 f"net {total_j - total_l:+d}*"
-                 + (f" (join requests: {total_req})" if total_req else ""))
+    # channels with no events this period still get a members line
+    silent = [cid for cid in member_counts if cid not in by_chat]
+    if silent:
+        lines.append("")
+        for cid in silent:
+            lines.append(f":zzz: *{chan_label(cid)}* — no events"
+                         f" · members now: {member_counts[cid]:,}")
+
+    if rows:
+        lines.append(f"\n*TOTAL: joins {total_j}, left {total_l}, "
+                     f"net {total_j - total_l:+d}*"
+                     + (f" (join requests: {total_req})" if total_req else ""))
     return "\n".join(lines)
 
 
@@ -277,28 +304,51 @@ async def run_daily_report(report_date=None):
     rows = stats_between(start_local.astimezone(timezone.utc),
                          end_local.astimezone(timezone.utc))
     date_str = report_date.isoformat()
+    counts = await get_member_counts()
 
     await post_to_slack(render_report(
-        rows, f":chart_with_upwards_trend: TG Tracker — daily report, {date_str}"))
-    if not rows:
-        return
+        rows, f":chart_with_upwards_trend: TG Tracker — daily report, {date_str}",
+        counts))
 
-    sheet_rows = [[date_str, chan_label(r["chat_id"]), r["link_name"],
-                   r["joins"] or 0, r["leaves"] or 0,
-                   (r["joins"] or 0) - (r["leaves"] or 0), r["requests"] or 0]
-                  for r in rows]
-    await export_to_sheets(sheet_rows)
+    if rows:
+        sheet_rows = [[date_str, chan_label(r["chat_id"]), r["link_name"],
+                       r["joins"] or 0, r["leaves"] or 0,
+                       (r["joins"] or 0) - (r["leaves"] or 0), r["requests"] or 0]
+                      for r in rows]
+        await export_to_sheets(sheet_rows)
+
+    # daily snapshot of total members per channel -> "Members" tab
+    if counts:
+        snapshot_date = now_local.date().isoformat()
+        member_rows = [[snapshot_date, chan_label(cid), n]
+                       for cid, n in counts.items()]
+        await export_to_sheets(member_rows, tab="Members",
+                               header=["date", "channel", "members"])
 
 
-def build_today_summary() -> str:
+async def build_period_report(days: int) -> str:
+    """Aggregated report for the last N days (including today so far)."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    rows = stats_between(start, end)
+    counts = await get_member_counts()
+    return render_report(
+        rows, f":bar_chart: TG Tracker — last {days} day(s), "
+              f"up to {datetime.now(REPORT_TZ).strftime('%Y-%m-%d %H:%M')}",
+        counts)
+
+
+async def build_today_summary() -> str:
     """Stats for today: from local midnight (REPORT_TZ) until now."""
     now_local = datetime.now(REPORT_TZ)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     rows = stats_between(start_local.astimezone(timezone.utc),
                          now_local.astimezone(timezone.utc))
+    counts = await get_member_counts()
     return render_report(
         rows, f":hourglass_flowing_sand: TG Tracker — today so far, "
-              f"{now_local.strftime('%Y-%m-%d %H:%M')}")
+              f"{now_local.strftime('%Y-%m-%d %H:%M')}",
+        counts)
 
 
 async def intraday_report_scheduler():
@@ -306,7 +356,7 @@ async def intraday_report_scheduler():
     while True:
         await asyncio.sleep(INTRADAY_HOURS * 3600)
         try:
-            await post_to_slack(build_today_summary())
+            await post_to_slack(await build_today_summary())
         except Exception as e:
             log.exception("Intraday report failed: %s", e)
 
@@ -508,29 +558,52 @@ async def cmd_stats(msg: Message):
     await msg.answer("\n".join(lines))
 
 
+@dp.message(Command("members"))
+async def cmd_members(msg: Message):
+    """Current total subscriber count per channel."""
+    if not is_admin(msg):
+        return
+    counts = await get_member_counts()
+    if not counts:
+        await msg.answer("Couldn't fetch member counts. Is the bot admin everywhere?")
+        return
+    lines = ["👥 Current members:"]
+    for cid, n in sorted(counts.items(), key=lambda x: -x[1]):
+        lines.append(f"• {chan_label(cid)}: {n:,}")
+    lines.append(f"\nTotal across channels: {sum(counts.values()):,}")
+    await msg.answer("\n".join(lines))
+
+
 @dp.message(Command("today"))
 async def cmd_today(msg: Message):
     """Today-so-far summary sent directly to this chat (no Slack/Sheets)."""
     if not is_admin(msg):
         return
-    text = build_today_summary().replace("*", "").replace("```", "")
+    text = (await build_today_summary()).replace("*", "").replace("```", "")
     await msg.answer(text.replace(":hourglass_flowing_sand: ", "⏳ ")
                          .replace(":loudspeaker: ", "📢 ")
+                         .replace(":zzz: ", "💤 ")
                          .replace(":chart_with_upwards_trend: ", "📈 "))
 
 
 @dp.message(Command("report"))
 async def cmd_report(msg: Message):
     """/report — yesterday (Slack+Sheets); /report today — today-so-far to Slack;
-    /report 2026-07-19 — specific date (Slack+Sheets)."""
+    /report 7d — last 7 days to Slack; /report 2026-07-19 — specific date."""
     if not is_admin(msg):
         return
     parts = msg.text.split()
     arg = parts[1].lower() if len(parts) > 1 else None
 
     if arg == "today":
-        await post_to_slack(build_today_summary())
+        await post_to_slack(await build_today_summary())
         await msg.answer("Today's summary sent to Slack.")
+        return
+
+    # period syntax: 7d, 30d, 90d ...
+    if arg and arg.endswith("d") and arg[:-1].isdigit():
+        await post_to_slack(await build_period_report(int(arg[:-1])))
+        await msg.answer(f"Last {arg[:-1]} days summary sent to Slack.")
         return
 
     report_date = None
@@ -538,8 +611,8 @@ async def cmd_report(msg: Message):
         try:
             report_date = datetime.strptime(arg, "%Y-%m-%d").date()
         except ValueError:
-            await msg.answer("Couldn't parse the date. Formats: /report, "
-                             "/report today, /report 2026-07-19")
+            await msg.answer("Couldn't parse the argument. Formats: /report, "
+                             "/report today, /report 7d, /report 2026-07-19")
             return
 
     await msg.answer("Running the report…")
