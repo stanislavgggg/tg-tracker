@@ -32,7 +32,13 @@ Env-переменные (Railway -> Variables):
     /newlink_req kadam_es_cr1 [-100X]— ссылка с join request (автоапрув)
     /links                           — все ссылки по каналам
     /stats [дней]                    — сводка по каналам и ссылкам
-    /report                          — дневной отчёт вручную (Slack + Sheets)
+    /today                           — сводка за сегодня прямо в чат
+    /report                          — отчёт за вчера (Slack + Sheets)
+    /report today                    — сводка за сегодня в Slack
+    /report 2026-07-19               — отчёт за конкретную дату (Slack + Sheets)
+
+Периодический intraday-отчёт: env INTRADAY_HOURS=2 -> каждые 2 часа
+сводка за текущий день в Slack (0 или не задано = выключено).
 """
 
 import asyncio
@@ -68,6 +74,7 @@ REPORT_TZ = ZoneInfo(os.environ.get("REPORT_TZ", "Europe/Madrid"))
 REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "9"))
 
 KEITARO_POSTBACK_URL = os.environ.get("KEITARO_POSTBACK_URL") or None
+INTRADAY_HOURS = int(os.environ.get("INTRADAY_HOURS", "0"))  # 0 = выкл; напр. 2 = каждые 2 часа
 DB_PATH = os.environ.get("DB_PATH", "tg_tracker.db")
 AUTO_APPROVE_JOIN_REQUESTS = os.environ.get("AUTO_APPROVE", "1") == "1"
 # ==================================================
@@ -254,6 +261,41 @@ async def run_daily_report(report_date=None):
     await export_to_sheets(sheet_rows)
 
 
+def build_today_summary() -> str:
+    """Текст со статистикой за сегодня (с полуночи по REPORT_TZ до текущего момента)."""
+    now_local = datetime.now(REPORT_TZ)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = stats_between(start_local.astimezone(timezone.utc),
+                         now_local.astimezone(timezone.utc))
+    header = (f":hourglass_flowing_sand: *TG Tracker — сегодня "
+              f"{now_local.strftime('%Y-%m-%d, на %H:%M')}*")
+    if not rows:
+        return header + "\nСобытий пока не было."
+
+    lines, current = [header], None
+    for r in rows:
+        if r["chat_id"] != current:
+            current = r["chat_id"]
+            lines.append(f"\n*{chan_label(current)}*")
+        j, l, req = r["joins"] or 0, r["leaves"] or 0, r["requests"] or 0
+        lines.append(f"• `{r['link_name']}`: +{j} / -{l} (net {j - l:+d})"
+                     + (f", req: {req}" if req else ""))
+    total_j = sum(r["joins"] or 0 for r in rows)
+    total_l = sum(r["leaves"] or 0 for r in rows)
+    lines.append(f"\nИтого: *+{total_j} / -{total_l}* (net {total_j - total_l:+d})")
+    return "\n".join(lines)
+
+
+async def intraday_report_scheduler():
+    """Каждые INTRADAY_HOURS часов постит в Slack сводку за текущий день."""
+    while True:
+        await asyncio.sleep(INTRADAY_HOURS * 3600)
+        try:
+            await post_to_slack(build_today_summary())
+        except Exception as e:
+            log.exception("Intraday report failed: %s", e)
+
+
 async def daily_report_scheduler():
     while True:
         now = datetime.now(REPORT_TZ)
@@ -421,12 +463,40 @@ async def cmd_stats(msg: Message):
     await msg.answer("\n".join(lines))
 
 
-@dp.message(Command("report"))
-async def cmd_report(msg: Message):
+@dp.message(Command("today"))
+async def cmd_today(msg: Message):
+    """Сводка за сегодня прямо в чат с ботом (без Slack/Sheets)."""
     if not is_admin(msg):
         return
-    await msg.answer("Запускаю отчёт за вчера…")
-    await run_daily_report()
+    text = build_today_summary().replace("*", "").replace("`", "")
+    await msg.answer(text.replace(":hourglass_flowing_sand: ", "⏳ "))
+
+
+@dp.message(Command("report"))
+async def cmd_report(msg: Message):
+    """/report — за вчера (Slack+Sheets); /report today — за сегодня в Slack;
+    /report 2026-07-19 — за конкретную дату (Slack+Sheets)."""
+    if not is_admin(msg):
+        return
+    parts = msg.text.split()
+    arg = parts[1].lower() if len(parts) > 1 else None
+
+    if arg == "today":
+        await post_to_slack(build_today_summary())
+        await msg.answer("Сводка за сегодня отправлена в Slack.")
+        return
+
+    report_date = None
+    if arg:
+        try:
+            report_date = datetime.strptime(arg, "%Y-%m-%d").date()
+        except ValueError:
+            await msg.answer("Не понял дату. Форматы: /report, /report today, "
+                             "/report 2026-07-19")
+            return
+
+    await msg.answer("Запускаю отчёт…")
+    await run_daily_report(report_date)
     await msg.answer("Готово. Проверь Slack и Google Sheets.")
 
 
@@ -445,6 +515,9 @@ async def main():
     log.info("Bot started. Channels: %s. DB: %s",
              ", ".join(chan_label(c) for c in CHANNEL_IDS), DB_PATH)
     asyncio.create_task(daily_report_scheduler())
+    if INTRADAY_HOURS > 0:
+        log.info("Intraday Slack report enabled: every %d h", INTRADAY_HOURS)
+        asyncio.create_task(intraday_report_scheduler())
     await dp.start_polling(
         bot,
         allowed_updates=["message", "chat_member", "chat_join_request"],
