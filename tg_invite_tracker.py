@@ -30,6 +30,8 @@ Env-переменные (Railway -> Variables):
     /newlink propeller_lv_cr3        — ссылка в первом (единственном) канале
     /newlink propeller_lv_cr3 -100X  — ссылка в конкретном канале
     /newlink_req kadam_es_cr1 [-100X]— ссылка с join request (автоапрув)
+    /addlink name https://t.me/+xxx [chat_id] — зарегистрировать СТАРУЮ ручную
+                                     ссылку под читаемым именем (переименует и прошлые события)
     /links                           — все ссылки по каналам
     /stats [дней]                    — сводка по каналам и ссылкам
     /today                           — сводка за сегодня прямо в чат
@@ -223,7 +225,48 @@ async def export_to_sheets(rows: list[list]):
         log.warning("Sheets export failed: %s", e)
 
 
-# ---------- Дневной отчёт ----------
+# ---------- Report rendering ----------
+def short_link_label(name: str) -> str:
+    """Named links stay as-is; unnamed raw URLs get truncated with a marker."""
+    if name.startswith("https://t.me/"):
+        return "unnamed:" + name.removeprefix("https://t.me/")[:12] + "…"
+    return name
+
+
+def render_report(rows, title: str) -> str:
+    """Slack message: per-channel monospace tables + grand total."""
+    if not rows:
+        return f"*{title}*\nNo events recorded in this period."
+
+    lines = [f"*{title}*"]
+    by_chat: dict[int, list] = {}
+    for r in rows:
+        by_chat.setdefault(r["chat_id"], []).append(r)
+
+    total_j = total_l = total_req = 0
+    for chat_id, chat_rows in by_chat.items():
+        c_j = sum(r["joins"] or 0 for r in chat_rows)
+        c_l = sum(r["leaves"] or 0 for r in chat_rows)
+        c_req = sum(r["requests"] or 0 for r in chat_rows)
+        total_j, total_l, total_req = total_j + c_j, total_l + c_l, total_req + c_req
+
+        lines.append(f"\n:loudspeaker: *{chan_label(chat_id)}* — "
+                     f"joins {c_j}, left {c_l}, net {c_j - c_l:+d}")
+        name_w = max([len(short_link_label(r["link_name"])) for r in chat_rows] + [4])
+        table = [f"{'link'.ljust(name_w)}  joins  left   net"]
+        for r in chat_rows:
+            j, l = r["joins"] or 0, r["leaves"] or 0
+            table.append(f"{short_link_label(r['link_name']).ljust(name_w)}"
+                         f"  {str(j).rjust(5)}  {str(l).rjust(4)}  {f'{j - l:+d}'.rjust(4)}")
+        lines.append("```" + "\n".join(table) + "```")
+
+    lines.append(f"*TOTAL: joins {total_j}, left {total_l}, "
+                 f"net {total_j - total_l:+d}*"
+                 + (f" (join requests: {total_req})" if total_req else ""))
+    return "\n".join(lines)
+
+
+# ---------- Daily report ----------
 async def run_daily_report(report_date=None):
     now_local = datetime.now(REPORT_TZ)
     if report_date is None:
@@ -235,59 +278,31 @@ async def run_daily_report(report_date=None):
                          end_local.astimezone(timezone.utc))
     date_str = report_date.isoformat()
 
+    await post_to_slack(render_report(
+        rows, f":chart_with_upwards_trend: TG Tracker — daily report, {date_str}"))
     if not rows:
-        await post_to_slack(f":chart_with_upwards_trend: *TG Tracker — {date_str}*\n"
-                            f"Событий за день не было.")
         return
 
-    lines = [f":chart_with_upwards_trend: *TG Tracker — {date_str}*"]
-    sheet_rows = []
-    current_chat = None
-    for r in rows:
-        if r["chat_id"] != current_chat:
-            current_chat = r["chat_id"]
-            lines.append(f"\n*{chan_label(current_chat)}*")
-        j, l, req = r["joins"] or 0, r["leaves"] or 0, r["requests"] or 0
-        lines.append(f"• `{r['link_name']}`: +{j} / -{l} (net {j - l:+d})"
-                     + (f", req: {req}" if req else ""))
-        sheet_rows.append([date_str, chan_label(r["chat_id"]), r["link_name"],
-                           j, l, j - l, req])
-
-    total_j = sum(r["joins"] or 0 for r in rows)
-    total_l = sum(r["leaves"] or 0 for r in rows)
-    lines.append(f"\nИтого: *+{total_j} / -{total_l}* (net {total_j - total_l:+d})")
-
-    await post_to_slack("\n".join(lines))
+    sheet_rows = [[date_str, chan_label(r["chat_id"]), r["link_name"],
+                   r["joins"] or 0, r["leaves"] or 0,
+                   (r["joins"] or 0) - (r["leaves"] or 0), r["requests"] or 0]
+                  for r in rows]
     await export_to_sheets(sheet_rows)
 
 
 def build_today_summary() -> str:
-    """Текст со статистикой за сегодня (с полуночи по REPORT_TZ до текущего момента)."""
+    """Stats for today: from local midnight (REPORT_TZ) until now."""
     now_local = datetime.now(REPORT_TZ)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     rows = stats_between(start_local.astimezone(timezone.utc),
                          now_local.astimezone(timezone.utc))
-    header = (f":hourglass_flowing_sand: *TG Tracker — сегодня "
-              f"{now_local.strftime('%Y-%m-%d, на %H:%M')}*")
-    if not rows:
-        return header + "\nСобытий пока не было."
-
-    lines, current = [header], None
-    for r in rows:
-        if r["chat_id"] != current:
-            current = r["chat_id"]
-            lines.append(f"\n*{chan_label(current)}*")
-        j, l, req = r["joins"] or 0, r["leaves"] or 0, r["requests"] or 0
-        lines.append(f"• `{r['link_name']}`: +{j} / -{l} (net {j - l:+d})"
-                     + (f", req: {req}" if req else ""))
-    total_j = sum(r["joins"] or 0 for r in rows)
-    total_l = sum(r["leaves"] or 0 for r in rows)
-    lines.append(f"\nИтого: *+{total_j} / -{total_l}* (net {total_j - total_l:+d})")
-    return "\n".join(lines)
+    return render_report(
+        rows, f":hourglass_flowing_sand: TG Tracker — today so far, "
+              f"{now_local.strftime('%Y-%m-%d %H:%M')}")
 
 
 async def intraday_report_scheduler():
-    """Каждые INTRADAY_HOURS часов постит в Slack сводку за текущий день."""
+    """Posts a today-so-far summary to Slack every INTRADAY_HOURS hours."""
     while True:
         await asyncio.sleep(INTRADAY_HOURS * 3600)
         try:
@@ -383,20 +398,21 @@ async def cmd_channels(msg: Message):
     if not is_admin(msg):
         return
     lines = [f"• {chan_label(cid)} — `{cid}`" for cid in CHANNEL_IDS]
-    await msg.answer("Отслеживаемые каналы:\n" + "\n".join(lines), parse_mode="Markdown")
+    await msg.answer("Tracked channels:\n" + "\n".join(lines), parse_mode="Markdown")
 
 
 async def _create_link(msg: Message, is_request: bool):
     parts = msg.text.split()
     if len(parts) < 2:
         cmd = "/newlink_req" if is_request else "/newlink"
-        await msg.answer(f"Использование: {cmd} имя_ссылки [chat_id]\n"
-                         f"chat_id обязателен, если каналов несколько — см. /channels")
+        await msg.answer(f"Usage: {cmd} link_name [chat_id]\n"
+                         f"chat_id is required when tracking multiple channels — see /channels")
         return
     name = parts[1].strip()[:32]
     chat_id = parse_target_channel(parts[2] if len(parts) > 2 else None)
     if chat_id is None:
-        await msg.answer("Не понял, для какого канала. Укажи chat_id: см. /channels")
+        await msg.answer("Couldn't resolve the target channel. "
+                         "Pass its chat_id — see /channels")
         return
     link = await bot.create_chat_invite_link(chat_id, name=name,
                                              creates_join_request=is_request)
@@ -404,8 +420,8 @@ async def _create_link(msg: Message, is_request: bool):
         conn.execute("INSERT OR REPLACE INTO links VALUES (?, ?, ?, ?, ?)",
                      (link.invite_link, chat_id, name, int(is_request),
                       datetime.now(timezone.utc).isoformat()))
-    kind = "Join-request ссылка" if is_request else "Ссылка"
-    await msg.answer(f"{kind} «{name}» для {chan_label(chat_id)}:\n{link.invite_link}")
+    kind = "Join-request link" if is_request else "Link"
+    await msg.answer(f"{kind} \"{name}\" for {chan_label(chat_id)}:\n{link.invite_link}")
 
 
 @dp.message(Command("newlink"))
@@ -420,6 +436,34 @@ async def cmd_newlink_req(msg: Message):
         await _create_link(msg, is_request=True)
 
 
+@dp.message(Command("addlink"))
+async def cmd_addlink(msg: Message):
+    """Register an EXISTING manually created invite link under a readable name,
+    so reports show the name instead of the raw URL.
+    Usage: /addlink propeller_lv_old1 https://t.me/+Kmq4hCIFxQs1YTQ0 [chat_id]"""
+    if not is_admin(msg):
+        return
+    parts = msg.text.split()
+    if len(parts) < 3 or not parts[2].startswith("https://t.me/"):
+        await msg.answer("Usage: /addlink name https://t.me/+xxxx [chat_id]")
+        return
+    name = parts[1].strip()[:32]
+    url = parts[2].strip()
+    chat_id = parse_target_channel(parts[3] if len(parts) > 3 else None)
+    if chat_id is None:
+        await msg.answer("Couldn't resolve the target channel. "
+                         "Pass its chat_id — see /channels")
+        return
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO links VALUES (?, ?, ?, 0, ?)",
+                     (url, chat_id, name, datetime.now(timezone.utc).isoformat()))
+        # rename the link in already recorded events too
+        conn.execute("UPDATE events SET link_name = ? WHERE invite_link = ?",
+                     (name, url))
+    await msg.answer(f"Registered \"{name}\" for {chan_label(chat_id)}.\n"
+                     f"Past and future events for this link will show this name.")
+
+
 @dp.message(Command("links"))
 async def cmd_links(msg: Message):
     if not is_admin(msg):
@@ -428,7 +472,8 @@ async def cmd_links(msg: Message):
         rows = conn.execute(
             "SELECT * FROM links ORDER BY chat_id, created_at DESC").fetchall()
     if not rows:
-        await msg.answer("Ссылок пока нет. Создай через /newlink <имя> [chat_id]")
+        await msg.answer("No links yet. Create one with /newlink <name> [chat_id] "
+                         "or register an existing one with /addlink")
         return
     lines, current = [], None
     for r in rows:
@@ -449,33 +494,35 @@ async def cmd_stats(msg: Message):
     start = end - timedelta(days=days) if days else datetime(2000, 1, 1, tzinfo=timezone.utc)
     rows = stats_between(start, end)
     if not rows:
-        await msg.answer("Событий пока нет.")
+        await msg.answer("No events recorded yet.")
         return
-    period = f"за {days} дн." if days else "за всё время"
-    lines, current = [f"📊 Статистика {period}:"], None
+    period = f"last {days} day(s)" if days else "all time"
+    lines, current = [f"📊 Stats — {period}:"], None
     for r in rows:
         if r["chat_id"] != current:
             current = r["chat_id"]
             lines.append(f"\n{chan_label(current)}:")
         j, l = r["joins"] or 0, r["leaves"] or 0
-        lines.append(f"• {r['link_name']}: +{j} / -{l} (net {j - l:+d})"
+        lines.append(f"• {short_link_label(r['link_name'])}: +{j} / -{l} (net {j - l:+d})"
                      + (f", req: {r['requests']}" if r["requests"] else ""))
     await msg.answer("\n".join(lines))
 
 
 @dp.message(Command("today"))
 async def cmd_today(msg: Message):
-    """Сводка за сегодня прямо в чат с ботом (без Slack/Sheets)."""
+    """Today-so-far summary sent directly to this chat (no Slack/Sheets)."""
     if not is_admin(msg):
         return
-    text = build_today_summary().replace("*", "").replace("`", "")
-    await msg.answer(text.replace(":hourglass_flowing_sand: ", "⏳ "))
+    text = build_today_summary().replace("*", "").replace("```", "")
+    await msg.answer(text.replace(":hourglass_flowing_sand: ", "⏳ ")
+                         .replace(":loudspeaker: ", "📢 ")
+                         .replace(":chart_with_upwards_trend: ", "📈 "))
 
 
 @dp.message(Command("report"))
 async def cmd_report(msg: Message):
-    """/report — за вчера (Slack+Sheets); /report today — за сегодня в Slack;
-    /report 2026-07-19 — за конкретную дату (Slack+Sheets)."""
+    """/report — yesterday (Slack+Sheets); /report today — today-so-far to Slack;
+    /report 2026-07-19 — specific date (Slack+Sheets)."""
     if not is_admin(msg):
         return
     parts = msg.text.split()
@@ -483,7 +530,7 @@ async def cmd_report(msg: Message):
 
     if arg == "today":
         await post_to_slack(build_today_summary())
-        await msg.answer("Сводка за сегодня отправлена в Slack.")
+        await msg.answer("Today's summary sent to Slack.")
         return
 
     report_date = None
@@ -491,13 +538,13 @@ async def cmd_report(msg: Message):
         try:
             report_date = datetime.strptime(arg, "%Y-%m-%d").date()
         except ValueError:
-            await msg.answer("Не понял дату. Форматы: /report, /report today, "
-                             "/report 2026-07-19")
+            await msg.answer("Couldn't parse the date. Formats: /report, "
+                             "/report today, /report 2026-07-19")
             return
 
-    await msg.answer("Запускаю отчёт…")
+    await msg.answer("Running the report…")
     await run_daily_report(report_date)
-    await msg.answer("Готово. Проверь Slack и Google Sheets.")
+    await msg.answer("Done. Check Slack and Google Sheets.")
 
 
 async def resolve_channel_titles():
@@ -506,7 +553,8 @@ async def resolve_channel_titles():
             chat = await bot.get_chat(cid)
             CHANNEL_TITLES[cid] = chat.title or str(cid)
         except Exception as e:
-            log.warning("Не смог получить канал %s: %s (бот точно админ?)", cid, e)
+            log.warning("Could not fetch channel %s: %s (is the bot an admin there?)",
+                        cid, e)
 
 
 async def main():
