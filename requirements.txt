@@ -1,0 +1,5 @@
+aiogram 
+aio 
+http 
+gspread 
+google-auth
