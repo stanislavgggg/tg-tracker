@@ -1,39 +1,44 @@
 """
-Telegram Invite Link Tracker + Slack daily report + Google Sheets export
+Telegram Invite Link Tracker — multi-channel, env-config (Railway-ready)
 ========================================================================
-Трекает вступления/выходы в канал по каждой invite-ссылке (SQLite),
-раз в день постит сводку в Slack и дописывает строки в Google Sheets.
-Опционально шлёт S2S postback в Keitaro при каждом join.
+Трекает вступления/выходы по каждой invite-ссылке в НЕСКОЛЬКИХ каналах,
+шлёт дневной отчёт в Slack и дописывает строки в Google Sheets.
 
-Требования:
-    pip install aiogram aiohttp gspread google-auth
+Зависимости (requirements.txt):
+    aiogram
+    aiohttp
+    gspread
+    google-auth
 
-Настройка Telegram:
-    1. Создай бота через @BotFather, получи токен.
-    2. Добавь бота АДМИНОМ в канал (право "Invite Users via Link").
-    3. Заполни BOT_TOKEN, CHANNEL_ID, ADMIN_USER_IDS.
+Env-переменные (Railway -> Variables):
+    BOT_TOKEN               токен бота (обязательно)
+    CHANNEL_IDS             ID каналов через запятую: -1003729676193,-1003237183860
+    ADMIN_USER_IDS          user_id админов через запятую
+    SLACK_WEBHOOK_URL       (опц.) Incoming Webhook для дневного отчёта
+    GSHEET_ID               (опц.) ID Google-таблицы
+    GOOGLE_CREDS_JSON       (опц.) содержимое service_account.json ЦЕЛИКОМ
+    GOOGLE_CREDS_FILE       (опц.) либо путь к файлу ключа (default service_account.json)
+    SHEET_TAB               (опц.) вкладка, default "TG Joins"
+    REPORT_TZ               (опц.) default "Europe/Madrid"
+    REPORT_HOUR             (опц.) default 9
+    KEITARO_POSTBACK_URL    (опц.) шаблон с {source} и {tg_user_id}
+    DB_PATH                 (опц.) default "tg_tracker.db"
+                            !! на Railway укажи путь на volume, напр. /data/tg_tracker.db
 
-Настройка Slack:
-    1. Slack -> Apps -> Incoming Webhooks -> создать webhook для нужного канала.
-    2. Вставь URL в SLACK_WEBHOOK_URL.
-
-Настройка Google Sheets:
-    1. console.cloud.google.com -> создать Service Account -> ключ JSON.
-    2. Включи Google Sheets API в проекте.
-    3. Скачанный JSON положи рядом со скриптом (GOOGLE_CREDS_FILE).
-    4. Расшарь таблицу на email сервис-аккаунта (Editor).
-    5. Вставь ID таблицы (из URL) в GSHEET_ID.
-
-Команды боту в личку (только ADMIN_USER_IDS):
-    /newlink propeller_lv_cr3   — создать именованную invite-ссылку
-    /newlink_req kadam_es_cr1   — ссылка с join request (автоапрув)
-    /links                      — список ссылок
-    /stats [дней]               — сводка в чат
-    /report                     — прогнать дневной отчёт вручную (Slack + Sheets)
+Команды боту в личку (только админы):
+    /channels                        — список отслеживаемых каналов
+    /newlink propeller_lv_cr3        — ссылка в первом (единственном) канале
+    /newlink propeller_lv_cr3 -100X  — ссылка в конкретном канале
+    /newlink_req kadam_es_cr1 [-100X]— ссылка с join request (автоапрув)
+    /links                           — все ссылки по каналам
+    /stats [дней]                    — сводка по каналам и ссылкам
+    /report                          — дневной отчёт вручную (Slack + Sheets)
 """
 
 import asyncio
+import json
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -43,33 +48,37 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message
 
-# ================== CONFIG ==================
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN"
-CHANNEL_ID = -1001234567890          # ID канала (бот должен быть админом)
-ADMIN_USER_IDS = {123456789}         # твой user_id (узнать: @userinfobot)
+# ================== CONFIG (env) ==================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# --- Slack ---
-SLACK_WEBHOOK_URL = None             # "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+CHANNEL_IDS: set[int] = {
+    int(x.strip()) for x in os.environ.get("CHANNEL_IDS", "").split(",") if x.strip()
+}
+ADMIN_USER_IDS: set[int] = {
+    int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()
+}
 
-# --- Google Sheets ---
-GSHEET_ID = None                     # ID таблицы из URL
-GOOGLE_CREDS_FILE = "service_account.json"
-SHEET_TAB = "TG Joins"               # вкладка; создастся сама, если нет
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL") or None
+GSHEET_ID = os.environ.get("GSHEET_ID") or None
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON") or None
+GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "service_account.json")
+SHEET_TAB = os.environ.get("SHEET_TAB", "TG Joins")
 
-# --- Расписание отчёта ---
-REPORT_TZ = ZoneInfo("Europe/Madrid")   # часовой пояс отчёта
-REPORT_HOUR = 9                          # каждый день в 09:00 — отчёт за вчера
+REPORT_TZ = ZoneInfo(os.environ.get("REPORT_TZ", "Europe/Madrid"))
+REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "9"))
 
-# --- Keitaro S2S postback (None чтобы выключить) ---
-KEITARO_POSTBACK_URL = None
-# KEITARO_POSTBACK_URL = "https://your-keitaro.com/postback?campaign={source}&status=join&subid_tg={tg_user_id}"
-
-DB_PATH = "tg_tracker.db"
-AUTO_APPROVE_JOIN_REQUESTS = True
-# ============================================
+KEITARO_POSTBACK_URL = os.environ.get("KEITARO_POSTBACK_URL") or None
+DB_PATH = os.environ.get("DB_PATH", "tg_tracker.db")
+AUTO_APPROVE_JOIN_REQUESTS = os.environ.get("AUTO_APPROVE", "1") == "1"
+# ==================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tg-tracker")
+
+if not CHANNEL_IDS:
+    raise SystemExit("CHANNEL_IDS не задан. Пример: -1003729676193,-1003237183860")
+
+CHANNEL_TITLES: dict[int, str] = {}  # заполняется на старте
 
 
 # ---------- DB ----------
@@ -84,6 +93,7 @@ def init_db():
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS links (
             invite_link TEXT PRIMARY KEY,
+            chat_id     INTEGER,
             name        TEXT,
             is_request  INTEGER DEFAULT 0,
             created_at  TEXT
@@ -91,13 +101,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS events (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          TEXT,               -- UTC ISO
+            chat_id     INTEGER,
             event       TEXT,               -- join | leave | request
             user_id     INTEGER,
             username    TEXT,
             invite_link TEXT,
             link_name   TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_events_link ON events(link_name);
+        CREATE INDEX IF NOT EXISTS idx_events_chat ON events(chat_id);
         CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(ts);
         """)
 
@@ -112,29 +123,33 @@ def link_name_for(invite_link: str | None) -> str:
     return row["name"] if row else invite_link
 
 
-def log_event(event: str, user_id: int, username: str | None,
+def log_event(chat_id: int, event: str, user_id: int, username: str | None,
               invite_link: str | None, link_name: str):
     with db() as conn:
         conn.execute(
-            "INSERT INTO events (ts, event, user_id, username, invite_link, link_name) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.now(timezone.utc).isoformat(), event,
+            "INSERT INTO events (ts, chat_id, event, user_id, username, invite_link, link_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), chat_id, event,
              user_id, username, invite_link, link_name),
         )
+
+
+def chan_label(chat_id: int) -> str:
+    return CHANNEL_TITLES.get(chat_id) or str(chat_id)
 
 
 def stats_between(start_utc: datetime, end_utc: datetime) -> list[sqlite3.Row]:
     with db() as conn:
         return conn.execute(
             """
-            SELECT link_name,
+            SELECT chat_id, link_name,
                    SUM(event = 'join')    AS joins,
                    SUM(event = 'leave')   AS leaves,
                    SUM(event = 'request') AS requests
             FROM events
             WHERE ts >= ? AND ts < ?
-            GROUP BY link_name
-            ORDER BY joins DESC
+            GROUP BY chat_id, link_name
+            ORDER BY chat_id, joins DESC
             """,
             (start_utc.isoformat(), end_utc.isoformat()),
         ).fetchall()
@@ -169,21 +184,23 @@ async def post_to_slack(text: str):
 
 # ---------- Google Sheets ----------
 def _sheets_append_sync(rows: list[list]):
-    """Синхронная запись через gspread; вызывается из to_thread."""
     import gspread
     from google.oauth2.service_account import Credentials
 
-    creds = Credentials.from_service_account_file(
-        GOOGLE_CREDS_FILE,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    if GOOGLE_CREDS_JSON:
+        creds = Credentials.from_service_account_info(
+            json.loads(GOOGLE_CREDS_JSON), scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
+
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(GSHEET_ID)
     try:
         ws = sh.worksheet(SHEET_TAB)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(SHEET_TAB, rows=1000, cols=10)
-        ws.append_row(["date", "link_name", "joins", "leaves", "net", "requests"],
+        ws.append_row(["date", "channel", "link_name", "joins", "leaves", "net", "requests"],
                       value_input_option="RAW")
     ws.append_rows(rows, value_input_option="RAW")
 
@@ -200,8 +217,7 @@ async def export_to_sheets(rows: list[list]):
 
 
 # ---------- Дневной отчёт ----------
-async def run_daily_report(report_date: datetime.date | None = None):
-    """Отчёт за календарный день report_date (по REPORT_TZ). По умолчанию — вчера."""
+async def run_daily_report(report_date=None):
     now_local = datetime.now(REPORT_TZ)
     if report_date is None:
         report_date = (now_local - timedelta(days=1)).date()
@@ -210,7 +226,6 @@ async def run_daily_report(report_date: datetime.date | None = None):
     end_local = start_local + timedelta(days=1)
     rows = stats_between(start_local.astimezone(timezone.utc),
                          end_local.astimezone(timezone.utc))
-
     date_str = report_date.isoformat()
 
     if not rows:
@@ -218,24 +233,28 @@ async def run_daily_report(report_date: datetime.date | None = None):
                             f"Событий за день не было.")
         return
 
-    total_j = sum(r["joins"] or 0 for r in rows)
-    total_l = sum(r["leaves"] or 0 for r in rows)
-
-    lines = [f":chart_with_upwards_trend: *TG Tracker — {date_str}*",
-             f"Всего: *+{total_j} / -{total_l}* (net {total_j - total_l:+d})", ""]
+    lines = [f":chart_with_upwards_trend: *TG Tracker — {date_str}*"]
     sheet_rows = []
+    current_chat = None
     for r in rows:
+        if r["chat_id"] != current_chat:
+            current_chat = r["chat_id"]
+            lines.append(f"\n*{chan_label(current_chat)}*")
         j, l, req = r["joins"] or 0, r["leaves"] or 0, r["requests"] or 0
         lines.append(f"• `{r['link_name']}`: +{j} / -{l} (net {j - l:+d})"
                      + (f", req: {req}" if req else ""))
-        sheet_rows.append([date_str, r["link_name"], j, l, j - l, req])
+        sheet_rows.append([date_str, chan_label(r["chat_id"]), r["link_name"],
+                           j, l, j - l, req])
+
+    total_j = sum(r["joins"] or 0 for r in rows)
+    total_l = sum(r["leaves"] or 0 for r in rows)
+    lines.append(f"\nИтого: *+{total_j} / -{total_l}* (net {total_j - total_l:+d})")
 
     await post_to_slack("\n".join(lines))
     await export_to_sheets(sheet_rows)
 
 
 async def daily_report_scheduler():
-    """Ждёт до REPORT_HOUR по REPORT_TZ и запускает отчёт за вчера. Каждый день."""
     while True:
         now = datetime.now(REPORT_TZ)
         next_run = now.replace(hour=REPORT_HOUR, minute=0, second=0, microsecond=0)
@@ -259,9 +278,22 @@ def is_admin(msg: Message) -> bool:
     return msg.from_user and msg.from_user.id in ADMIN_USER_IDS
 
 
+def parse_target_channel(arg: str | None) -> int | None:
+    """Определяет канал: явный ID из команды или единственный канал по умолчанию."""
+    if arg:
+        try:
+            cid = int(arg)
+            return cid if cid in CHANNEL_IDS else None
+        except ValueError:
+            return None
+    if len(CHANNEL_IDS) == 1:
+        return next(iter(CHANNEL_IDS))
+    return None
+
+
 @dp.chat_member()
 async def on_member_update(update: ChatMemberUpdated):
-    if update.chat.id != CHANNEL_ID:
+    if update.chat.id not in CHANNEL_IDS:
         return
     old, new = update.old_chat_member.status, update.new_chat_member.status
     user = update.new_chat_member.user
@@ -271,29 +303,31 @@ async def on_member_update(update: ChatMemberUpdated):
     if joined:
         raw = update.invite_link.invite_link if update.invite_link else None
         name = link_name_for(raw)
-        log_event("join", user.id, user.username, raw, name)
-        log.info("JOIN %s (@%s) via %s", user.id, user.username, name)
+        log_event(update.chat.id, "join", user.id, user.username, raw, name)
+        log.info("JOIN %s (@%s) via %s in %s", user.id, user.username, name,
+                 chan_label(update.chat.id))
         await fire_postback(name, user.id)
     elif left:
         with db() as conn:
             row = conn.execute(
                 "SELECT link_name, invite_link FROM events "
-                "WHERE user_id = ? AND event IN ('join','request') "
-                "ORDER BY ts DESC LIMIT 1", (user.id,)
+                "WHERE user_id = ? AND chat_id = ? AND event IN ('join','request') "
+                "ORDER BY ts DESC LIMIT 1", (user.id, update.chat.id)
             ).fetchone()
         name = row["link_name"] if row else "unknown/organic"
         raw = row["invite_link"] if row else None
-        log_event("leave", user.id, user.username, raw, name)
-        log.info("LEAVE %s (@%s) attributed to %s", user.id, user.username, name)
+        log_event(update.chat.id, "leave", user.id, user.username, raw, name)
+        log.info("LEAVE %s (@%s) attributed to %s in %s", user.id, user.username,
+                 name, chan_label(update.chat.id))
 
 
 @dp.chat_join_request()
 async def on_join_request(req: ChatJoinRequest):
-    if req.chat.id != CHANNEL_ID:
+    if req.chat.id not in CHANNEL_IDS:
         return
     raw = req.invite_link.invite_link if req.invite_link else None
     name = link_name_for(raw)
-    log_event("request", req.from_user.id, req.from_user.username, raw, name)
+    log_event(req.chat.id, "request", req.from_user.id, req.from_user.username, raw, name)
     if AUTO_APPROVE_JOIN_REQUESTS:
         try:
             await req.approve()
@@ -302,37 +336,46 @@ async def on_join_request(req: ChatJoinRequest):
             log.warning("Approve failed: %s", e)
 
 
-@dp.message(Command("newlink"))
-async def cmd_newlink(msg: Message):
+@dp.message(Command("channels"))
+async def cmd_channels(msg: Message):
     if not is_admin(msg):
         return
-    parts = msg.text.split(maxsplit=1)
+    lines = [f"• {chan_label(cid)} — `{cid}`" for cid in CHANNEL_IDS]
+    await msg.answer("Отслеживаемые каналы:\n" + "\n".join(lines), parse_mode="Markdown")
+
+
+async def _create_link(msg: Message, is_request: bool):
+    parts = msg.text.split()
     if len(parts) < 2:
-        await msg.answer("Использование: /newlink propeller_lv_cr3")
+        cmd = "/newlink_req" if is_request else "/newlink"
+        await msg.answer(f"Использование: {cmd} имя_ссылки [chat_id]\n"
+                         f"chat_id обязателен, если каналов несколько — см. /channels")
         return
     name = parts[1].strip()[:32]
-    link = await bot.create_chat_invite_link(CHANNEL_ID, name=name)
+    chat_id = parse_target_channel(parts[2] if len(parts) > 2 else None)
+    if chat_id is None:
+        await msg.answer("Не понял, для какого канала. Укажи chat_id: см. /channels")
+        return
+    link = await bot.create_chat_invite_link(chat_id, name=name,
+                                             creates_join_request=is_request)
     with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO links VALUES (?, ?, 0, ?)",
-                     (link.invite_link, name, datetime.now(timezone.utc).isoformat()))
-    await msg.answer(f"Ссылка «{name}»:\n{link.invite_link}")
+        conn.execute("INSERT OR REPLACE INTO links VALUES (?, ?, ?, ?, ?)",
+                     (link.invite_link, chat_id, name, int(is_request),
+                      datetime.now(timezone.utc).isoformat()))
+    kind = "Join-request ссылка" if is_request else "Ссылка"
+    await msg.answer(f"{kind} «{name}» для {chan_label(chat_id)}:\n{link.invite_link}")
+
+
+@dp.message(Command("newlink"))
+async def cmd_newlink(msg: Message):
+    if is_admin(msg):
+        await _create_link(msg, is_request=False)
 
 
 @dp.message(Command("newlink_req"))
 async def cmd_newlink_req(msg: Message):
-    if not is_admin(msg):
-        return
-    parts = msg.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await msg.answer("Использование: /newlink_req kadam_es_cr1")
-        return
-    name = parts[1].strip()[:32]
-    link = await bot.create_chat_invite_link(CHANNEL_ID, name=name,
-                                             creates_join_request=True)
-    with db() as conn:
-        conn.execute("INSERT OR REPLACE INTO links VALUES (?, ?, 1, ?)",
-                     (link.invite_link, name, datetime.now(timezone.utc).isoformat()))
-    await msg.answer(f"Join-request ссылка «{name}»:\n{link.invite_link}")
+    if is_admin(msg):
+        await _create_link(msg, is_request=True)
 
 
 @dp.message(Command("links"))
@@ -340,13 +383,18 @@ async def cmd_links(msg: Message):
     if not is_admin(msg):
         return
     with db() as conn:
-        rows = conn.execute("SELECT * FROM links ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM links ORDER BY chat_id, created_at DESC").fetchall()
     if not rows:
-        await msg.answer("Ссылок пока нет. Создай через /newlink <имя>")
+        await msg.answer("Ссылок пока нет. Создай через /newlink <имя> [chat_id]")
         return
-    lines = [f"• {r['name']}{' (req)' if r['is_request'] else ''}\n  {r['invite_link']}"
-             for r in rows]
-    await msg.answer("\n".join(lines))
+    lines, current = [], None
+    for r in rows:
+        if r["chat_id"] != current:
+            current = r["chat_id"]
+            lines.append(f"\n{chan_label(current)}:")
+        lines.append(f"• {r['name']}{' (req)' if r['is_request'] else ''}\n  {r['invite_link']}")
+    await msg.answer("\n".join(lines).strip())
 
 
 @dp.message(Command("stats"))
@@ -362,8 +410,11 @@ async def cmd_stats(msg: Message):
         await msg.answer("Событий пока нет.")
         return
     period = f"за {days} дн." if days else "за всё время"
-    lines = [f"📊 Статистика {period}:\n"]
+    lines, current = [f"📊 Статистика {period}:"], None
     for r in rows:
+        if r["chat_id"] != current:
+            current = r["chat_id"]
+            lines.append(f"\n{chan_label(current)}:")
         j, l = r["joins"] or 0, r["leaves"] or 0
         lines.append(f"• {r['link_name']}: +{j} / -{l} (net {j - l:+d})"
                      + (f", req: {r['requests']}" if r["requests"] else ""))
@@ -372,7 +423,6 @@ async def cmd_stats(msg: Message):
 
 @dp.message(Command("report"))
 async def cmd_report(msg: Message):
-    """Ручной прогон дневного отчёта (за вчера) — Slack + Sheets."""
     if not is_admin(msg):
         return
     await msg.answer("Запускаю отчёт за вчера…")
@@ -380,9 +430,20 @@ async def cmd_report(msg: Message):
     await msg.answer("Готово. Проверь Slack и Google Sheets.")
 
 
+async def resolve_channel_titles():
+    for cid in CHANNEL_IDS:
+        try:
+            chat = await bot.get_chat(cid)
+            CHANNEL_TITLES[cid] = chat.title or str(cid)
+        except Exception as e:
+            log.warning("Не смог получить канал %s: %s (бот точно админ?)", cid, e)
+
+
 async def main():
     init_db()
-    log.info("Bot started. DB: %s", DB_PATH)
+    await resolve_channel_titles()
+    log.info("Bot started. Channels: %s. DB: %s",
+             ", ".join(chan_label(c) for c in CHANNEL_IDS), DB_PATH)
     asyncio.create_task(daily_report_scheduler())
     await dp.start_polling(
         bot,
