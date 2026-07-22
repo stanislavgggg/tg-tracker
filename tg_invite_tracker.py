@@ -79,6 +79,16 @@ REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "9"))
 
 KEITARO_POSTBACK_URL = os.environ.get("KEITARO_POSTBACK_URL") or None
 INTRADAY_HOURS = int(os.environ.get("INTRADAY_HOURS", "0"))  # 0 = выкл; напр. 2 = каждые 2 часа
+
+# --- Alerts (posted to Slack after the daily report when triggered) ---
+ALERT_ORGANIC_NET = int(os.environ.get("ALERT_ORGANIC_NET", "5"))
+#   organic net loss of >= N in a channel per day -> alert
+ALERT_MIN_LEAVES = int(os.environ.get("ALERT_MIN_LEAVES", "10"))
+ALERT_LEAVE_RATIO = float(os.environ.get("ALERT_LEAVE_RATIO", "1.5"))
+#   channel churn: leaves >= MIN_LEAVES and leaves >= joins * RATIO -> alert
+ALERT_SPIKE_MULT = float(os.environ.get("ALERT_SPIKE_MULT", "2.0"))
+#   leaves >= yesterday's leaves * MULT (and >= MIN_LEAVES) -> alert
+
 DB_PATH = os.environ.get("DB_PATH", "tg_tracker.db")
 AUTO_APPROVE_JOIN_REQUESTS = os.environ.get("AUTO_APPROVE", "1") == "1"
 # ==================================================
@@ -299,6 +309,58 @@ def render_report(rows, title: str, member_counts: dict[int, int] | None = None)
     return "\n".join(lines)
 
 
+# ---------- Anomaly alerts ----------
+def detect_anomalies(rows, prev_rows=None) -> list[str]:
+    """Returns a list of human-readable alert lines. Empty list = all good.
+    Rules:
+      1. Organic outflow: unknown/organic net <= -ALERT_ORGANIC_NET in a channel
+      2. High churn: channel leaves >= ALERT_MIN_LEAVES and >= joins * ALERT_LEAVE_RATIO
+      3. Churn spike vs previous day: channel leaves >= prev_leaves * ALERT_SPIKE_MULT
+    """
+    alerts = []
+
+    by_chat: dict[int, list] = {}
+    for r in rows:
+        by_chat.setdefault(r["chat_id"], []).append(r)
+
+    prev_leaves_by_chat: dict[int, int] = {}
+    if prev_rows:
+        for r in prev_rows:
+            prev_leaves_by_chat[r["chat_id"]] = (
+                prev_leaves_by_chat.get(r["chat_id"], 0) + (r["leaves"] or 0))
+
+    for chat_id, chat_rows in by_chat.items():
+        label = chan_label(chat_id)
+        c_j = sum(r["joins"] or 0 for r in chat_rows)
+        c_l = sum(r["leaves"] or 0 for r in chat_rows)
+
+        # 1. organic outflow
+        for r in chat_rows:
+            if r["link_name"] == "unknown/organic":
+                o_j, o_l = r["joins"] or 0, r["leaves"] or 0
+                if o_j - o_l <= -ALERT_ORGANIC_NET:
+                    alerts.append(
+                        f"*{label}*: organic net {o_j - o_l:+d} "
+                        f"({o_j} joined / {o_l} left) — losing organic subscribers")
+
+        # 2. high churn overall
+        if c_l >= ALERT_MIN_LEAVES and c_j > 0 and c_l >= c_j * ALERT_LEAVE_RATIO:
+            alerts.append(
+                f"*{label}*: churn {c_l} left vs {c_j} joined "
+                f"(ratio {c_l / c_j:.1f}x) — leaves outpacing joins")
+        elif c_l >= ALERT_MIN_LEAVES and c_j == 0:
+            alerts.append(f"*{label}*: {c_l} left with zero joins")
+
+        # 3. spike vs previous day
+        prev_l = prev_leaves_by_chat.get(chat_id, 0)
+        if prev_l > 0 and c_l >= ALERT_MIN_LEAVES and c_l >= prev_l * ALERT_SPIKE_MULT:
+            alerts.append(
+                f"*{label}*: leaves spiked to {c_l} "
+                f"(vs {prev_l} the day before, {c_l / prev_l:.1f}x)")
+
+    return alerts
+
+
 # ---------- Daily report ----------
 async def run_daily_report(report_date=None):
     now_local = datetime.now(REPORT_TZ)
@@ -315,6 +377,15 @@ async def run_daily_report(report_date=None):
     await post_to_slack(render_report(
         rows, f":chart_with_upwards_trend: TG Tracker — daily report, {date_str}",
         counts))
+
+    # anomaly alerts, compared against the previous day
+    prev_start = start_local - timedelta(days=1)
+    prev_rows = stats_between(prev_start.astimezone(timezone.utc),
+                              start_local.astimezone(timezone.utc))
+    alerts = detect_anomalies(rows, prev_rows)
+    if alerts:
+        await post_to_slack(f":warning: *TG Tracker alerts — {date_str}*\n"
+                            + "\n".join(f"• {a}" for a in alerts))
 
     if rows:
         sheet_rows = [[date_str, chan_label(r["chat_id"]), r["link_name"],
