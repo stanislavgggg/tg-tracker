@@ -140,14 +140,40 @@ def init_db():
         """)
 
 
-def link_name_for(invite_link: str | None) -> str:
+def _strip_ellipsis(link: str) -> str | None:
+    """Telegram truncates invite links created by other admins: the bot receives
+    e.g. 'https://t.me/+159dnYgJ…' or '...'-suffixed. Returns the prefix, or None
+    if the link is not truncated."""
+    for suffix in ("…", "..."):
+        if link.endswith(suffix):
+            return link[: -len(suffix)]
+    return None
+
+
+def resolve_link(invite_link: str | None) -> tuple[str | None, str]:
+    """Returns (canonical_invite_link, display_name).
+    Handles both full links (created by the bot) and truncated links
+    (manual links created by human admins, which Telegram hides the tail of)."""
     if not invite_link:
-        return "unknown/organic"
+        return None, "unknown/organic"
     with db() as conn:
         row = conn.execute(
-            "SELECT name FROM links WHERE invite_link = ?", (invite_link,)
-        ).fetchone()
-    return row["name"] if row else invite_link
+            "SELECT invite_link, name FROM links WHERE invite_link = ?",
+            (invite_link,)).fetchone()
+        if row:
+            return row["invite_link"], row["name"]
+        prefix = _strip_ellipsis(invite_link)
+        if prefix and len(prefix) > len("https://t.me/+") + 3:
+            rows = conn.execute(
+                "SELECT invite_link, name FROM links WHERE invite_link LIKE ?",
+                (prefix + "%",)).fetchall()
+            if len(rows) == 1:
+                return rows[0]["invite_link"], rows[0]["name"]
+    return invite_link, invite_link
+
+
+def link_name_for(invite_link: str | None) -> str:
+    return resolve_link(invite_link)[1]
 
 
 def log_event(chat_id: int, event: str, user_id: int, username: str | None,
@@ -486,8 +512,8 @@ async def on_member_update(update: ChatMemberUpdated):
 
     if joined:
         raw = update.invite_link.invite_link if update.invite_link else None
-        name = link_name_for(raw)
-        log_event(update.chat.id, "join", user.id, user.username, raw, name)
+        canonical, name = resolve_link(raw)
+        log_event(update.chat.id, "join", user.id, user.username, canonical, name)
         log.info("JOIN %s (@%s) via %s in %s", user.id, user.username, name,
                  chan_label(update.chat.id))
         await fire_postback(name, user.id)
@@ -510,8 +536,9 @@ async def on_join_request(req: ChatJoinRequest):
     if req.chat.id not in CHANNEL_IDS:
         return
     raw = req.invite_link.invite_link if req.invite_link else None
-    name = link_name_for(raw)
-    log_event(req.chat.id, "request", req.from_user.id, req.from_user.username, raw, name)
+    canonical, name = resolve_link(raw)
+    log_event(req.chat.id, "request", req.from_user.id, req.from_user.username,
+              canonical, name)
     if AUTO_APPROVE_JOIN_REQUESTS:
         try:
             await req.approve()
@@ -584,11 +611,24 @@ async def cmd_addlink(msg: Message):
     with db() as conn:
         conn.execute("INSERT OR REPLACE INTO links VALUES (?, ?, ?, 0, ?)",
                      (url, chat_id, name, datetime.now(timezone.utc).isoformat()))
-        # rename the link in already recorded events too
-        conn.execute("UPDATE events SET link_name = ? WHERE invite_link = ?",
-                     (name, url))
+        # rename already recorded events: exact matches AND truncated forms
+        # (Telegram hides the tail of links created by human admins, so stored
+        #  events may look like 'https://t.me/+159dnYgJ…')
+        cur = conn.execute(
+            """
+            UPDATE events SET link_name = ?, invite_link = ?
+            WHERE invite_link = ?
+               OR (
+                    (invite_link LIKE '%…' OR invite_link LIKE '%...')
+                AND LENGTH(REPLACE(REPLACE(invite_link,'…',''),'...','')) > 17
+                AND ? LIKE REPLACE(REPLACE(invite_link,'…',''),'...','') || '%'
+               )
+            """,
+            (name, url, url, url))
+        renamed = cur.rowcount
     await msg.answer(f"Registered \"{name}\" for {chan_label(chat_id)}.\n"
-                     f"Past and future events for this link will show this name.")
+                     f"Renamed {renamed} past event(s); future events for this "
+                     f"link will show this name.")
 
 
 @dp.message(Command("links"))
