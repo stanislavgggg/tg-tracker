@@ -659,6 +659,22 @@ async def cmd_help(msg: Message):
         ih=INTRADAY_HOURS if INTRADAY_HOURS else "off"))
 
 
+@dp.channel_post()
+async def on_channel_post(msg: Message):
+    """The bot receives posts from every channel where it's an admin.
+    Any post auto-registers that channel for /discover."""
+    chat = msg.chat
+    with db() as conn:
+        known = conn.execute("SELECT 1 FROM known_chats WHERE chat_id = ?",
+                             (chat.id,)).fetchone()
+        conn.execute(
+            "INSERT OR REPLACE INTO known_chats VALUES (?, ?, 'administrator', ?)",
+            (chat.id, chat.title or str(chat.id),
+             datetime.now(timezone.utc).isoformat()))
+    if not known:
+        log.info("Discovered channel via post: %s (%s)", chat.title, chat.id)
+
+
 @dp.my_chat_member()
 async def on_bot_membership_change(update: ChatMemberUpdated):
     """Fires when the bot itself is added/removed/promoted in any chat.
@@ -741,7 +757,7 @@ async def main():
     await dp.start_polling(
         bot,
         allowed_updates=["message", "chat_member", "chat_join_request",
-                         "my_chat_member"],
+                         "my_chat_member", "channel_post"],
     )
 
 
