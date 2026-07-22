@@ -121,6 +121,12 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_events_chat ON events(chat_id);
         CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(ts);
+        CREATE TABLE IF NOT EXISTS known_chats (
+            chat_id  INTEGER PRIMARY KEY,
+            title    TEXT,
+            status   TEXT,
+            seen_at  TEXT
+        );
         """)
 
 
@@ -620,6 +626,85 @@ async def cmd_report(msg: Message):
     await msg.answer("Done. Check Slack and Google Sheets.")
 
 
+HELP_TEXT = """Available commands:
+
+Links
+/newlink name [chat_id] — create a tracked invite link
+/newlink_req name [chat_id] — same, but with join request (auto-approve, filters bots)
+/addlink name https://t.me/+xxx [chat_id] — register an existing manual link under a name
+/links — list all registered links per channel
+
+Stats
+/today — today-so-far summary (here, in chat)
+/stats [days] — quick per-link stats (all time or last N days)
+/members — current subscriber totals per channel
+/channels — tracked channels and their chat IDs
+
+Reports to Slack
+/report — yesterday's report (Slack + Google Sheets)
+/report today — today-so-far to Slack
+/report 7d | 30d — aggregated period report to Slack
+/report 2026-07-19 — report for a specific date
+
+Automatic: daily report at {rh}:00 ({tz}), intraday every {ih}h.
+"""
+
+
+@dp.message(Command("help", "start"))
+async def cmd_help(msg: Message):
+    if not is_admin(msg):
+        return
+    await msg.answer(HELP_TEXT.format(
+        rh=REPORT_HOUR, tz=str(REPORT_TZ),
+        ih=INTRADAY_HOURS if INTRADAY_HOURS else "off"))
+
+
+@dp.my_chat_member()
+async def on_bot_membership_change(update: ChatMemberUpdated):
+    """Fires when the bot itself is added/removed/promoted in any chat.
+    Remembers every channel so /discover can list them with IDs."""
+    chat = update.chat
+    status = update.new_chat_member.status
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO known_chats VALUES (?, ?, ?, ?)",
+            (chat.id, chat.title or chat.username or str(chat.id), status,
+             datetime.now(timezone.utc).isoformat()))
+    log.info("Bot membership change: %s (%s) -> %s", chat.title, chat.id, status)
+
+
+@dp.message(Command("discover"))
+async def cmd_discover(msg: Message):
+    """All channels where the bot has been added, with a ready-to-paste
+    CHANNEL_IDS string (admin-status chats only)."""
+    if not is_admin(msg):
+        return
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM known_chats ORDER BY seen_at DESC").fetchall()
+    if not rows:
+        await msg.answer(
+            "No channels discovered yet. Add the bot as ADMIN to your channels — "
+            "each one will appear here automatically. Then run /discover again.")
+        return
+
+    admin_ids = []
+    lines = ["Channels the bot has been added to:\n"]
+    for r in rows:
+        tracked = " ✅ tracked" if r["chat_id"] in CHANNEL_IDS else ""
+        if r["status"] == "administrator":
+            admin_ids.append(str(r["chat_id"]))
+            lines.append(f"• {r['title']} — {r['chat_id']} (admin){tracked}")
+        else:
+            lines.append(f"• {r['title']} — {r['chat_id']} ({r['status']}, "
+                         f"needs admin!){tracked}")
+
+    if admin_ids:
+        lines.append("\nReady-to-paste CHANNEL_IDS value (admin chats only):")
+        lines.append(",".join(admin_ids))
+    await msg.answer("\n".join(lines))
+
+
 async def resolve_channel_titles():
     for cid in CHANNEL_IDS:
         try:
@@ -633,6 +718,20 @@ async def resolve_channel_titles():
 async def main():
     init_db()
     await resolve_channel_titles()
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="help", description="List all commands"),
+        BotCommand(command="today", description="Today-so-far summary"),
+        BotCommand(command="members", description="Current subscribers per channel"),
+        BotCommand(command="stats", description="Per-link stats (/stats 7 = last 7 days)"),
+        BotCommand(command="report", description="Send report to Slack (/report today, 7d, date)"),
+        BotCommand(command="newlink", description="Create tracked invite link"),
+        BotCommand(command="newlink_req", description="Create join-request link"),
+        BotCommand(command="addlink", description="Register existing manual link"),
+        BotCommand(command="links", description="List registered links"),
+        BotCommand(command="channels", description="Tracked channels + chat IDs"),
+        BotCommand(command="discover", description="List all channels bot was added to (with IDs)"),
+    ])
     log.info("Bot started. Channels: %s. DB: %s",
              ", ".join(chan_label(c) for c in CHANNEL_IDS), DB_PATH)
     asyncio.create_task(daily_report_scheduler())
@@ -641,7 +740,8 @@ async def main():
         asyncio.create_task(intraday_report_scheduler())
     await dp.start_polling(
         bot,
-        allowed_updates=["message", "chat_member", "chat_join_request"],
+        allowed_updates=["message", "chat_member", "chat_join_request",
+                         "my_chat_member"],
     )
 
 
