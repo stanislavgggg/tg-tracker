@@ -268,7 +268,7 @@ async def export_to_sheets(rows: list[list], tab: str | None = None,
         await asyncio.to_thread(_sheets_append_sync, tab, header, rows)
         log.info("Sheets [%s]: appended %d rows", tab, len(rows))
     except Exception as e:
-        log.warning("Sheets export failed: %s", e)
+        log.exception("Sheets export failed (%s): %r", type(e).__name__, e)
 
 
 # ---------- Report rendering ----------
@@ -830,6 +830,39 @@ async def cmd_discover(msg: Message):
         lines.append("\nReady-to-paste CHANNEL_IDS value (admin chats only):")
         lines.append(",".join(admin_ids))
     await msg.answer("\n".join(lines))
+
+
+@dp.message(Command("sheets_test"))
+async def cmd_sheets_test(msg: Message):
+    """Tries a test write to Google Sheets and reports the exact result here."""
+    if not is_admin(msg):
+        return
+    if not GSHEET_ID:
+        await msg.answer("GSHEET_ID is not set in environment variables.")
+        return
+    await msg.answer("Testing Google Sheets write…")
+    try:
+        await asyncio.to_thread(
+            _sheets_append_sync, "_test", ["ts", "note"],
+            [[datetime.now(timezone.utc).isoformat(), "connectivity test"]])
+        await msg.answer("✅ Success! Wrote a test row to tab \"_test\". "
+                         "You can delete that tab. Exports will work now.")
+    except Exception as e:
+        detail = repr(e)[:800]
+        hint = ""
+        name = type(e).__name__
+        if "SpreadsheetNotFound" in name or "404" in detail:
+            hint = ("\n\nMost likely: the sheet is NOT shared with the service "
+                    "account. Open the JSON key, copy client_email, and share "
+                    "the spreadsheet with it (Editor).")
+        elif "PERMISSION_DENIED" in detail or "403" in detail:
+            hint = ("\n\nThe service account can see the sheet but can't write, "
+                    "or Sheets API is disabled. Check: share = Editor, and "
+                    "Google Sheets API enabled in the Cloud project.")
+        elif "JSONDecode" in name or "Expecting" in detail:
+            hint = ("\n\nGOOGLE_CREDS_JSON seems malformed. Re-paste the full "
+                    "JSON key file content via the Variables UI (not Raw Editor).")
+        await msg.answer(f"❌ Failed: {name}\n{detail}{hint}")
 
 
 async def resolve_channel_titles():
