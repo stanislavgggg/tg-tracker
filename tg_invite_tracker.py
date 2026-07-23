@@ -76,6 +76,7 @@ SHEET_TAB = os.environ.get("SHEET_TAB", "TG Joins")
 
 REPORT_TZ = ZoneInfo(os.environ.get("REPORT_TZ", "Europe/Madrid"))
 REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "9"))
+EVENING_HOUR = int(os.environ.get("EVENING_HOUR", "19"))  # today-so-far digest (REPORT_TZ); -1 = off
 
 KEITARO_POSTBACK_URL = os.environ.get("KEITARO_POSTBACK_URL") or None
 INTRADAY_HOURS = int(os.environ.get("INTRADAY_HOURS", "0"))  # 0 = выкл; напр. 2 = каждые 2 часа
@@ -335,6 +336,34 @@ def render_report(rows, title: str, member_counts: dict[int, int] | None = None)
     return "\n".join(lines)
 
 
+def render_report_compact(rows, title: str, member_counts: dict[int, int] | None = None) -> str:
+    """Condensed digest: one line per channel — members now + net for the period.
+    No per-link tables (those are on demand via /report and /stats)."""
+    member_counts = member_counts or {}
+    agg: dict[int, list] = {}
+    for r in rows:
+        j, l = r["joins"] or 0, r["leaves"] or 0
+        a = agg.setdefault(r["chat_id"], [0, 0])
+        a[0] += j
+        a[1] += l
+    total_j = sum(a[0] for a in agg.values())
+    total_l = sum(a[1] for a in agg.values())
+
+    lines = [f"*{title}*",
+             f"Net: *{total_j - total_l:+d}* (joins {total_j} · left {total_l})", ""]
+
+    all_cids = set(member_counts) | set(agg)
+    order = sorted(all_cids, key=lambda c: (member_counts.get(c, 0), c), reverse=True)
+    for cid in order:
+        j, l = agg.get(cid, [0, 0])
+        m = member_counts.get(cid)
+        mstr = f"{m:,} members" if m is not None else "members n/a"
+        lines.append(f"• *{chan_label(cid)}* — {mstr}  (net {j - l:+d})")
+
+    lines.append("\n_Per-link breakdown on demand: `/report today` · `/stats 7` (in Telegram)_")
+    return "\n".join(lines)
+
+
 # ---------- Anomaly alerts ----------
 def detect_anomalies(rows, prev_rows=None) -> list[str]:
     """Returns a list of human-readable alert lines. Empty list = all good.
@@ -400,8 +429,8 @@ async def run_daily_report(report_date=None):
     date_str = report_date.isoformat()
     counts = await get_member_counts()
 
-    await post_to_slack(render_report(
-        rows, f":chart_with_upwards_trend: TG Tracker — daily report, {date_str}",
+    await post_to_slack(render_report_compact(
+        rows, f":sunrise: TG — morning report, {date_str} (yesterday)",
         counts))
 
     # anomaly alerts, compared against the previous day
@@ -477,6 +506,33 @@ async def daily_report_scheduler():
             await run_daily_report()
         except Exception as e:
             log.exception("Daily report failed: %s", e)
+
+
+async def run_evening_report():
+    """Condensed today-so-far digest (from local midnight to now)."""
+    now_local = datetime.now(REPORT_TZ)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = stats_between(start_local.astimezone(timezone.utc),
+                         now_local.astimezone(timezone.utc))
+    counts = await get_member_counts()
+    await post_to_slack(render_report_compact(
+        rows, f":city_sunset: TG — evening report, {now_local.strftime('%Y-%m-%d %H:%M')} (today so far)",
+        counts))
+
+
+async def evening_report_scheduler():
+    while True:
+        now = datetime.now(REPORT_TZ)
+        next_run = now.replace(hour=EVENING_HOUR, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        wait = (next_run - now).total_seconds()
+        log.info("Next evening report at %s (in %.0f min)", next_run, wait / 60)
+        await asyncio.sleep(wait)
+        try:
+            await run_evening_report()
+        except Exception as e:
+            log.exception("Evening report failed: %s", e)
 
 
 # ---------- Bot ----------
@@ -895,6 +951,8 @@ async def main():
     log.info("Bot started. Channels: %s. DB: %s",
              ", ".join(chan_label(c) for c in CHANNEL_IDS), DB_PATH)
     asyncio.create_task(daily_report_scheduler())
+    if EVENING_HOUR >= 0:
+        asyncio.create_task(evening_report_scheduler())
     if INTRADAY_HOURS > 0:
         log.info("Intraday Slack report enabled: every %d h", INTRADAY_HOURS)
         asyncio.create_task(intraday_report_scheduler())
