@@ -237,7 +237,8 @@ async def post_to_slack(text: str):
 
 
 # ---------- Google Sheets ----------
-def _sheets_append_sync(tab: str, header: list[str], rows: list[list]):
+def _sheets_append_sync(tab: str, header: list[str], rows: list[list],
+                        replace_date: str | None = None):
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -255,18 +256,41 @@ def _sheets_append_sync(tab: str, header: list[str], rows: list[list]):
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(tab, rows=1000, cols=10)
         ws.append_row(header, value_input_option="RAW")
+    if replace_date:
+        # idempotent export: drop rows already written for this date, so a
+        # re-run (manual /report, partial "today" run, restart) never duplicates
+        col_a = ws.col_values(1)
+        idx = [i + 1 for i, v in enumerate(col_a) if i > 0 and v == replace_date]
+        # delete contiguous blocks bottom-up so indices stay valid
+        blocks, start, prev = [], None, None
+        for i in idx:
+            if start is None:
+                start = prev = i
+            elif i == prev + 1:
+                prev = i
+            else:
+                blocks.append((start, prev))
+                start = prev = i
+        if start is not None:
+            blocks.append((start, prev))
+        for a, b in reversed(blocks):
+            ws.delete_rows(a, b)
+        if idx:
+            log.info("Sheets [%s]: replaced %d existing row(s) for %s",
+                     tab, len(idx), replace_date)
     ws.append_rows(rows, value_input_option="RAW")
 
 
 async def export_to_sheets(rows: list[list], tab: str | None = None,
-                           header: list[str] | None = None):
+                           header: list[str] | None = None,
+                           replace_date: str | None = None):
     if not GSHEET_ID:
         log.info("GSHEET_ID not configured, skipping")
         return
     tab = tab or SHEET_TAB
     header = header or ["date", "channel", "link_name", "joins", "leaves", "net", "requests"]
     try:
-        await asyncio.to_thread(_sheets_append_sync, tab, header, rows)
+        await asyncio.to_thread(_sheets_append_sync, tab, header, rows, replace_date)
         log.info("Sheets [%s]: appended %d rows", tab, len(rows))
     except Exception as e:
         log.exception("Sheets export failed (%s): %r", type(e).__name__, e)
@@ -429,9 +453,13 @@ async def run_daily_report(report_date=None):
     date_str = report_date.isoformat()
     counts = await get_member_counts()
 
-    await post_to_slack(render_report_compact(
-        rows, f":sunrise: TG — morning report, {date_str} (yesterday)",
-        counts))
+    if report_date == now_local.date():
+        title = f":hourglass_flowing_sand: TG — {date_str} (today so far)"
+    elif report_date == (now_local - timedelta(days=1)).date():
+        title = f":sunrise: TG — morning report, {date_str} (yesterday)"
+    else:
+        title = f":repeat: TG — re-run report, {date_str}"
+    await post_to_slack(render_report_compact(rows, title, counts))
 
     # anomaly alerts, compared against the previous day
     prev_start = start_local - timedelta(days=1)
@@ -447,7 +475,7 @@ async def run_daily_report(report_date=None):
                        r["joins"] or 0, r["leaves"] or 0,
                        (r["joins"] or 0) - (r["leaves"] or 0), r["requests"] or 0]
                       for r in rows]
-        await export_to_sheets(sheet_rows)
+        await export_to_sheets(sheet_rows, replace_date=date_str)
 
     # daily snapshot of total members per channel -> "Members" tab
     if counts:
@@ -455,7 +483,8 @@ async def run_daily_report(report_date=None):
         member_rows = [[snapshot_date, chan_label(cid), n]
                        for cid, n in counts.items()]
         await export_to_sheets(member_rows, tab="Members",
-                               header=["date", "channel", "members"])
+                               header=["date", "channel", "members"],
+                               replace_date=snapshot_date)
 
 
 async def build_period_report(days: int) -> str:
@@ -825,6 +854,108 @@ async def cmd_report(msg: Message):
     await msg.answer("Done. Check Slack and Google Sheets.")
 
 
+def build_audit(days: int) -> str:
+    """Integrity check: are we losing attribution or whole channels?"""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    out = [f"🔍 Audit — last {days} day(s)"]
+    with db() as conn:
+        registered = {r["invite_link"]: r for r in conn.execute("SELECT * FROM links")}
+
+        # 1. joins via links that have no readable name
+        unnamed = conn.execute(
+            """SELECT chat_id, invite_link, SUM(event='join') AS j,
+                      SUM(event='leave') AS l, MAX(ts) AS last_ts
+               FROM events
+               WHERE ts >= ? AND invite_link IS NOT NULL
+                 AND (link_name LIKE 'https://t.me/%' OR link_name = invite_link)
+               GROUP BY chat_id, invite_link ORDER BY j DESC""",
+            (start.isoformat(),)).fetchall()
+        unnamed = [r for r in unnamed if r["invite_link"] not in registered]
+        out.append(f"\n1) Unnamed invite links: {len(unnamed)}")
+        if unnamed:
+            out.append("   Register each with /addlink name <full link> <chat_id>")
+        for r in unnamed:
+            out.append(f"• {chan_label(r['chat_id'])} ({r['chat_id']}): "
+                       f"{r['invite_link']}  +{r['j'] or 0}/-{r['l'] or 0}, "
+                       f"last {r['last_ts'][:10]}")
+
+        # 2. truncated links matching several registered links (can't resolve)
+        amb = []
+        for r in unnamed:
+            prefix = _strip_ellipsis(r["invite_link"] or "")
+            if prefix:
+                n = sum(1 for k in registered if k.startswith(prefix))
+                if n > 1:
+                    amb.append(f"• {r['invite_link']} matches {n} registered links")
+        if amb:
+            out.append(f"\n2) Ambiguous truncated links: {len(amb)}")
+            out += amb
+
+        # 3. registered links that got nothing in the period
+        used = {r["invite_link"] for r in conn.execute(
+            "SELECT DISTINCT invite_link FROM events WHERE ts >= ?",
+            (start.isoformat(),))}
+        idle = [r for k, r in registered.items() if k not in used]
+        out.append(f"\n3) Registered links with 0 events in period: {len(idle)}")
+        for r in sorted(idle, key=lambda r: r["chat_id"]):
+            out.append(f"• {chan_label(r['chat_id'])}: {r['name']}")
+
+        # 4. channels: bot is admin but not tracked / tracked but unreachable
+        known = conn.execute("SELECT * FROM known_chats").fetchall()
+        untracked = [k for k in known
+                     if k["status"] == "administrator" and k["chat_id"] not in CHANNEL_IDS]
+        no_title = [c for c in CHANNEL_IDS if c not in CHANNEL_TITLES]
+        silent = [c for c in CHANNEL_IDS if not conn.execute(
+            "SELECT 1 FROM events WHERE chat_id = ? AND ts >= ? LIMIT 1",
+            (c, start.isoformat())).fetchone()]
+        out.append(f"\n4) Channels")
+        out.append(f"• admin but NOT in CHANNEL_IDS: {len(untracked)}")
+        out += [f"   – {k['title']} ({k['chat_id']})" for k in untracked]
+        out.append(f"• tracked but title not resolved (bot not admin?): {len(no_title)}")
+        out += [f"   – {c}" for c in no_title]
+        out.append(f"• tracked but 0 events in period: {len(silent)}")
+        out += [f"   – {chan_label(c)} ({c})" for c in silent]
+
+        # 5. days with no events at all = bot was probably down
+        days_with = {r[0] for r in conn.execute(
+            "SELECT DISTINCT substr(ts, 1, 10) FROM events WHERE ts >= ?",
+            (start.isoformat(),))}
+        gaps = []
+        d = start.date() + timedelta(days=1)
+        while d < now.date():
+            if d.isoformat() not in days_with:
+                gaps.append(d.isoformat())
+            d += timedelta(days=1)
+        out.append(f"\n5) Days with zero events (possible downtime): {len(gaps)}")
+        if gaps:
+            out.append("   " + ", ".join(gaps))
+
+        # 6. share of joins without any link, per channel
+        org = conn.execute(
+            """SELECT chat_id, SUM(event='join') AS j,
+                      SUM(event='join' AND invite_link IS NULL) AS o
+               FROM events WHERE ts >= ? GROUP BY chat_id""",
+            (start.isoformat(),)).fetchall()
+        out.append("\n6) Joins without invite link (organic / public username):")
+        for r in sorted(org, key=lambda r: -(r["o"] or 0)):
+            j, o = r["j"] or 0, r["o"] or 0
+            if j:
+                flag = " ⚠️" if j >= 20 and o / j > 0.5 else ""
+                out.append(f"• {chan_label(r['chat_id'])}: {o}/{j} ({o / j:.0%}){flag}")
+    return "\n".join(out)
+
+
+@dp.message(Command("audit"))
+async def cmd_audit(msg: Message):
+    """/audit [days] — integrity check of links, channels and gaps (default 30)."""
+    if not is_admin(msg):
+        return
+    parts = msg.text.split()
+    days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
+    await answer_long(msg, build_audit(days))
+
+
 HELP_TEXT = """Available commands:
 
 Links
@@ -838,12 +969,14 @@ Stats
 /stats [days] — quick per-link stats (all time or last N days)
 /members — current subscriber totals per channel
 /channels — tracked channels and their chat IDs
+/audit [days] — integrity check: unnamed links, idle links, untracked channels, gaps
 
 Reports to Slack
 /report — yesterday's report (Slack + Google Sheets)
 /report today — today-so-far to Slack
 /report 7d | 30d — aggregated period report to Slack
-/report 2026-07-19 — report for a specific date
+/report 2026-07-19 — report for a specific date (also today's date: today-so-far
+  into Sheets; re-running a date replaces its rows, never duplicates)
 
 Automatic: daily report at {rh}:00 ({tz}), intraday every {ih}h.
 """
@@ -979,6 +1112,7 @@ async def main():
         BotCommand(command="links", description="List registered links"),
         BotCommand(command="channels", description="Tracked channels + chat IDs"),
         BotCommand(command="discover", description="List all channels bot was added to (with IDs)"),
+        BotCommand(command="audit", description="Integrity check (/audit 30)"),
     ])
     log.info("Bot started. Channels: %s. DB: %s",
              ", ".join(chan_label(c) for c in CHANNEL_IDS), DB_PATH)
