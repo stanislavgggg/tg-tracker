@@ -540,6 +540,38 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 
+TG_MSG_LIMIT = 4000  # Telegram hard limit is 4096; keep a safety margin
+
+
+def split_message(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
+    """Split text into chunks <= limit, breaking on line boundaries
+    (blank lines first, so channel blocks stay together when possible)."""
+    chunks, buf = [], ""
+    for line in text.split("\n"):
+        # a single line longer than the limit: hard-cut it
+        while len(line) > limit:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{buf}\n{line}" if buf else line
+        if len(candidate) > limit:
+            chunks.append(buf)
+            buf = line
+        else:
+            buf = candidate
+    if buf.strip():
+        chunks.append(buf)
+    return [c.strip("\n") for c in chunks if c.strip()]
+
+
+async def answer_long(msg: Message, text: str, **kwargs) -> None:
+    """msg.answer() that never hits 'message is too long'."""
+    for chunk in split_message(text):
+        await msg.answer(chunk, **kwargs)
+
+
 def is_admin(msg: Message) -> bool:
     return msg.from_user and msg.from_user.id in ADMIN_USER_IDS
 
@@ -608,7 +640,7 @@ async def cmd_channels(msg: Message):
     if not is_admin(msg):
         return
     lines = [f"• {chan_label(cid)} — `{cid}`" for cid in CHANNEL_IDS]
-    await msg.answer("Tracked channels:\n" + "\n".join(lines), parse_mode="Markdown")
+    await answer_long(msg, "Tracked channels:\n" + "\n".join(lines), parse_mode="Markdown")
 
 
 async def _create_link(msg: Message, is_request: bool):
@@ -704,7 +736,7 @@ async def cmd_links(msg: Message):
             current = r["chat_id"]
             lines.append(f"\n{chan_label(current)}:")
         lines.append(f"• {r['name']}{' (req)' if r['is_request'] else ''}\n  {r['invite_link']}")
-    await msg.answer("\n".join(lines).strip())
+    await answer_long(msg, "\n".join(lines).strip())
 
 
 @dp.message(Command("stats"))
@@ -728,7 +760,7 @@ async def cmd_stats(msg: Message):
         j, l = r["joins"] or 0, r["leaves"] or 0
         lines.append(f"• {short_link_label(r['link_name'])}: +{j} / -{l} (net {j - l:+d})"
                      + (f", req: {r['requests']}" if r["requests"] else ""))
-    await msg.answer("\n".join(lines))
+    await answer_long(msg, "\n".join(lines))
 
 
 @dp.message(Command("members"))
@@ -744,7 +776,7 @@ async def cmd_members(msg: Message):
     for cid, n in sorted(counts.items(), key=lambda x: -x[1]):
         lines.append(f"• {chan_label(cid)}: {n:,}")
     lines.append(f"\nTotal across channels: {sum(counts.values()):,}")
-    await msg.answer("\n".join(lines))
+    await answer_long(msg, "\n".join(lines))
 
 
 @dp.message(Command("today"))
@@ -753,7 +785,7 @@ async def cmd_today(msg: Message):
     if not is_admin(msg):
         return
     text = (await build_today_summary()).replace("*", "").replace("```", "")
-    await msg.answer(text.replace(":hourglass_flowing_sand: ", "⏳ ")
+    await answer_long(msg, text.replace(":hourglass_flowing_sand: ", "⏳ ")
                          .replace(":loudspeaker: ", "📢 ")
                          .replace(":zzz: ", "💤 ")
                          .replace(":chart_with_upwards_trend: ", "📈 "))
@@ -885,7 +917,7 @@ async def cmd_discover(msg: Message):
     if admin_ids:
         lines.append("\nReady-to-paste CHANNEL_IDS value (admin chats only):")
         lines.append(",".join(admin_ids))
-    await msg.answer("\n".join(lines))
+    await answer_long(msg, "\n".join(lines))
 
 
 @dp.message(Command("sheets_test"))
