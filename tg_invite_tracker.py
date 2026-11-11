@@ -58,6 +58,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message
 
+import tg_activity
+
 # ================== CONFIG (env) ==================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
@@ -139,6 +141,7 @@ def init_db():
             seen_at  TEXT
         );
         """)
+        tg_activity.init_tables(conn)
 
 
 def _strip_ellipsis(link: str) -> str | None:
@@ -254,7 +257,7 @@ def _sheets_append_sync(tab: str, header: list[str], rows: list[list],
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(tab, rows=1000, cols=10)
+        ws = sh.add_worksheet(tab, rows=1000, cols=max(10, len(header)))
         ws.append_row(header, value_input_option="RAW")
     if replace_date:
         # idempotent export: drop rows already written for this date, so a
@@ -535,6 +538,21 @@ async def daily_report_scheduler():
             await run_daily_report()
         except Exception as e:
             log.exception("Daily report failed: %s", e)
+
+
+async def activity_scheduler():
+    while True:
+        now = datetime.now(REPORT_TZ)
+        next_run = now.replace(hour=tg_activity.ACTIVITY_HOUR, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        wait = (next_run - now).total_seconds()
+        log.info("Next activity snapshot at %s (in %.0f min)", next_run, wait / 60)
+        await asyncio.sleep(wait)
+        try:
+            await tg_activity.run(CHANNEL_IDS, DB_PATH, chan_label, export_to_sheets)
+        except Exception as e:
+            log.exception("Activity snapshot failed: %s", e)
 
 
 async def run_evening_report():
@@ -970,6 +988,7 @@ Stats
 /members — current subscriber totals per channel
 /channels — tracked channels and their chat IDs
 /audit [days] — integrity check: unnamed links, idle links, untracked channels, gaps
+/activity — snapshot of subscribers' last seen -> Sheets tabs Activity / Activity by Source
 
 Reports to Slack
 /report — yesterday's report (Slack + Google Sheets)
@@ -980,6 +999,23 @@ Reports to Slack
 
 Automatic: daily report at {rh}:00 ({tz}), intraday every {ih}h.
 """
+
+
+@dp.message(Command("activity"))
+async def cmd_activity(msg: Message):
+    """Снимок last seen подписчиков прямо сейчас -> вкладки Activity / Activity by Source."""
+    if not is_admin(msg):
+        return
+    if not tg_activity.ENABLED:
+        await msg.answer("Не заданы API_ID / API_HASH / SESSION_STRING (см. tg_activity.py).")
+        return
+    await msg.answer("⏳ Снимаю статусы подписчиков, это может занять несколько минут…")
+    try:
+        text = await tg_activity.run(CHANNEL_IDS, DB_PATH, chan_label, export_to_sheets)
+    except Exception as e:
+        log.exception("/activity failed: %s", e)
+        text = f"❌ Ошибка: {e!r}"
+    await answer_long(msg, text)
 
 
 @dp.message(Command("help", "start"))
@@ -1113,12 +1149,16 @@ async def main():
         BotCommand(command="channels", description="Tracked channels + chat IDs"),
         BotCommand(command="discover", description="List all channels bot was added to (with IDs)"),
         BotCommand(command="audit", description="Integrity check (/audit 30)"),
+        BotCommand(command="activity", description="Subscriber last-seen snapshot -> Sheets"),
     ])
     log.info("Bot started. Channels: %s. DB: %s",
              ", ".join(chan_label(c) for c in CHANNEL_IDS), DB_PATH)
     asyncio.create_task(daily_report_scheduler())
     if EVENING_HOUR >= 0:
         asyncio.create_task(evening_report_scheduler())
+    if tg_activity.ENABLED:
+        log.info("Activity snapshots enabled: daily at %02d:00 %s", tg_activity.ACTIVITY_HOUR, REPORT_TZ)
+        asyncio.create_task(activity_scheduler())
     if INTRADAY_HOURS > 0:
         log.info("Intraday Slack report enabled: every %d h", INTRADAY_HOURS)
         asyncio.create_task(intraday_report_scheduler())

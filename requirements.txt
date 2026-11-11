@@ -2,3 +2,4 @@ aiogram
 aiohttp
 gspread
 google-auth
+telethon
