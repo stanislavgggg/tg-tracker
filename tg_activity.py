@@ -76,9 +76,9 @@ SOURCE_HEADER = ["date", "channel", "link_name", "joined", "in_channel_now", "re
                  "checked", "coverage_%", "active_7d", "active_7d_%_of_checked",
                  "active_7d_%_of_joined", "active_30d", "active_30d_%_of_checked", "hidden_%_of_checked"]
 
-COHORT_HEADER = ["Channel", "Link", "Joined in week starting (Mon)", "Joined", "Still in channel",
-                 "Still in %", "Stayed 7d %", "Status known %", "Active 7d %", "Active 30d %",
-                 "vs channel avg (pp)", "Data quality"]
+COHORT_HEADER = ["Channel", "Link", "Joined in week starting (Mon)", "Joined", "★ Alive 7d % (North Star)",
+                 "Still in channel", "Still in %", "Stayed 7d %", "Status known %", "Active 7d %", "Active 30d %",
+                 "Data quality"]
 SUMMARY_FIXED = ["Channel", "Link"]
 
 _lock = None  # один Telegram-коннект за раз: два одновременных клиента на одной сессии её ломают
@@ -438,11 +438,6 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
                          pct(nn, jn) if jn and nn <= jn else "", n, pct(n, nn), a7, pct(a7, n),
                          pct(a7, jn) if jn else "", a30, pct(a30, n), pct(hid, n)])
     # --- ссылка × неделя вступления (читаемый вид) ---
-    avg = {}  # пулованная доля активных 7д по каналу, для колонки «vs channel avg»
-    for chat_id in chat_ids:
-        b = [status[u] for u in members.get(chat_id, ()) if u in status]
-        if b:
-            avg[chat_id] = pct(sum(1 for x in b if x in ACTIVE_7D), len(b))
     # Stayed 7d по событиям трекера: считаем только тех, кто вступил не менее 7 дней назад
     last_join, leaves = {}, {}
     for chat_id, user_id, ev, _, ts in events:
@@ -482,11 +477,13 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
         ok = n >= MIN_CHECKED and cov >= MIN_COVERAGE and not fresh
         a7 = pct(sum(1 for x in b if x in ACTIVE_7D), n)
         a30 = pct(sum(1 for x in b if x in ACTIVE_30D), n)
-        vs = round(a7 - avg[chat_id], 1) if ok and chat_id in avg else ""
         stay = pct(g["stayed"], g["m"]) if g["m"] >= MIN_CHECKED else ""
         quality = "Too fresh" if fresh else ("OK" if ok else "Low data")
-        coh_rows.append([label_fn(chat_id), name, wk, jn, nn,
-                         pct(nn, jn) if jn and nn <= jn else "", stay, cov, a7, a30, vs, quality])
+        # North Star: из ВСЕХ вступивших по ссылке за неделю — сколько сейчас подписаны И активны за 7 дней.
+        # = Still in % × Active 7d %. Для «Too fresh» когорт бессмысленна (активны по определению) — пусто.
+        star = round(a7 * nn / jn, 1) if jn and 0 < n and nn <= jn and not fresh else ""
+        coh_rows.append([label_fn(chat_id), name, wk, jn, star, nn,
+                         pct(nn, jn) if jn and nn <= jn else "", stay, cov, a7, a30, quality])
     return ch_rows, src_rows, coh_rows
 
 
@@ -500,9 +497,9 @@ def summary_weeks():
 
 def summary_header(old_wk, new_wk):
     return ["Channel", "Link",
-            f"Joined (week {old_wk})", f"Stayed 7d % ({old_wk})", f"Active 7d % ({old_wk})",
-            f"Joined (week {new_wk})", f"Stayed 7d % ({new_wk})", f"Active 7d % ({new_wk})",
-            "Change: stayed (pp)", "Change: active (pp)", "Data quality"]
+            f"Joined (week {old_wk})", f"Stayed 7d % ({old_wk})", f"★ Alive 7d % ({old_wk})",
+            f"Joined (week {new_wk})", f"Stayed 7d % ({new_wk})", f"★ Alive 7d % ({new_wk})",
+            "Change ★ (pp)", "Data quality"]
 
 
 def build_summary(coh_rows):
@@ -515,13 +512,11 @@ def build_summary(coh_rows):
     out = []
     for (ch, link), d in sorted(by.items()):
         o, n = d.get(old_wk), d.get(new_wk)
-        ok = bool(o and n and o[11] == "OK" and n[11] == "OK")
-        dstay = round(n[6] - o[6], 1) if o and n and o[6] != "" and n[6] != "" else ""
-        dact = round(n[8] - o[8], 1) if ok else ""
+        ok = bool(o and n and o[11] == "OK" and n[11] == "OK" and o[4] != "" and n[4] != "")
         out.append([ch, link,
-                    o[3] if o else 0, o[6] if o else "", o[8] if o else "",
-                    n[3] if n else 0, n[6] if n else "", n[8] if n else "",
-                    dstay, dact, "OK" if ok else "Low data"])
+                    o[3] if o else 0, o[7] if o else "", o[4] if o else "",
+                    n[3] if n else 0, n[7] if n else "", n[4] if n else "",
+                    round(n[4] - o[4], 1) if ok else "", "OK" if ok else "Low data"])
     return out
 
 
@@ -532,7 +527,7 @@ def howto_rows():
         "One invite link = one approach, so each row is the traffic quality of one approach in one join week.",
         "",
         "WHERE TO LOOK",
-        "Summary: each link, the two latest mature weeks side by side. Start here.",
+        "Summary: each link, the two latest mature weeks side by side, with the change in the North Star. Start here.",
         "Cohorts: every link x every join week. Use the filter on the header row (channel, link).",
         "Activity Channels / Activity Sources: daily detail per channel and per link, for deeper digging.",
         "",
@@ -547,7 +542,8 @@ def howto_rows():
         "Stayed 7d %: of those who joined at least 7 days ago, the share that did not leave within 7 days. Blank if there are too few people.",
         "Status known %: for what share of the people still in the channel we know their last-seen status. This is the reliability of the Active columns.",
         "Active 7d % / Active 30d %: share of known people who were in Telegram in the last 7 / 30 days.",
-        "vs channel avg (pp): this cohort's Active 7d % minus the whole channel's Active 7d %, in percentage points. Green = better than the channel, red = worse.",
+        "★ Alive 7d % (North Star): of EVERYONE who joined through this link that week, the share who are still subscribed AND were in Telegram in the last 7 days. "
+        "It equals Still in % x Active 7d %. One number for the whole picture: losing people lowers it, and keeping people who are inactive also lowers it. Higher is better. Empty for Too fresh cohorts.",
         "Data quality: OK = enough people with known status (at least %d, and at least %d%% of them known) and the cohort is mature. Low data or Too fresh rows are greyed out: do not draw conclusions from them." % (MIN_CHECKED, MIN_COVERAGE),
         "",
         "HOW TO COMPARE FAIRLY",
@@ -568,47 +564,40 @@ GREEN, RED, GREY = (0.85, 0.95, 0.85), (0.98, 0.84, 0.84), (0.6, 0.6, 0.6)
 
 
 def _view_cohorts():
-    from tg_sheets_format import col_letter as L
-    q, v = L(11), L(10)
     return dict(
         ncols=12, index=2, tab_color=(0.2, 0.6, 0.35), freeze_cols=2, filter=True,
-        widths=[210, 200, 130, 80, 90, 85, 90, 95, 90, 90, 110, 100],
-        percent_cols=[5, 6, 7, 8, 9], pp_cols=[10],
+        widths=[210, 200, 130, 80, 120, 90, 85, 90, 95, 90, 90, 100],
+        percent_cols=[4, 6, 7, 8, 9, 10], bold_cols=[4], tint_cols=[4],
         notes=["Telegram channel.", "Invite link name (one link = one approach).",
                "Monday of the week the people joined.",
                "People who joined via this link in that week.",
+               "North Star. Of everyone who joined via this link that week: share still subscribed AND active in Telegram in the last 7 days. = Still in % x Active 7d %. Higher is better. Empty for Too fresh cohorts.",
                "How many of them are still subscribed now.",
                "Still in channel / Joined. Blank if it is not reliable (more people than joined).",
                "Of those who joined at least 7 days ago: share that did not leave within 7 days. Same age for every cohort, so comparable. Blank if too few people.",
                "For what share of the people still in the channel we know last seen. Low = do not trust the Active columns.",
                "Share of known people in Telegram within the last 7 days. Meaningless for cohorts that joined in the last 7 days.",
                "Same for 30 days.",
-               "This cohort's Active 7d % minus the whole channel's. Green = better than channel, red = worse. Only for OK rows.",
                "OK = enough known people, enough coverage and a mature cohort. Too fresh = joined less than 14 days ago (Active is not comparable yet). Low data = too few known people."],
-        rules=[dict(formula=f'=OR(${q}2="Low data",${q}2="Too fresh")', c0=0, c1=12, fg=GREY),
-               dict(formula=f'=AND(${q}2="OK",${v}2>0)', c0=10, c1=11, bg=GREEN),
-               dict(formula=f'=AND(${q}2="OK",${v}2<0)', c0=10, c1=11, bg=RED)])
+        rules=[dict(formula='=OR($L2="Low data",$L2="Too fresh")', c0=0, c1=12, fg=GREY)])
 
 
 def _view_summary():
     return dict(
-        ncols=11, index=1, tab_color=(0.2, 0.45, 0.8), freeze_cols=2, filter=True, header_height=64,
-        widths=[210, 200, 100, 100, 100, 100, 100, 100, 105, 105, 100],
-        percent_cols=[3, 4, 6, 7], pp_cols=[8, 9],
+        ncols=10, index=1, tab_color=(0.2, 0.45, 0.8), freeze_cols=2, filter=True, header_height=64,
+        widths=[210, 200, 100, 100, 110, 100, 100, 110, 105, 100],
+        percent_cols=[3, 4, 6, 7], pp_cols=[8], bold_cols=[4, 7], tint_cols=[4, 7],
         notes=["Telegram channel.", "Invite link name.",
                "People who joined via this link in the older of the two compared weeks.",
                "Of those, share that did not leave within 7 days after joining.",
-               "Share of known people from that cohort in Telegram in the last 7 days (the cohort is mature, so this is meaningful).",
+               "North Star of the older week: of everyone who joined, share still subscribed AND active in Telegram in the last 7 days.",
                "People who joined via this link in the newer of the two compared weeks.",
-               "Same: stayed 7 days.", "Same: active in the last 7 days.",
-               "Newer minus older, in percentage points. Green = newer week is better.",
-               "Newer minus older, in percentage points. Only if both weeks have OK data.",
+               "Same: stayed 7 days.", "North Star of the newer week.",
+               "Newer minus older North Star, in percentage points. Green = newer week is better. Only if both weeks have OK data.",
                "OK only if both weeks have enough known people. Otherwise Low data."],
-        rules=[dict(formula='=$K2="Low data"', c0=0, c1=11, fg=GREY),
-               dict(formula='=AND($I2<>"",$I2>0)', c0=8, c1=9, bg=GREEN),
-               dict(formula='=AND($I2<>"",$I2<0)', c0=8, c1=9, bg=RED),
-               dict(formula='=AND($K2="OK",$J2>0)', c0=9, c1=10, bg=GREEN),
-               dict(formula='=AND($K2="OK",$J2<0)', c0=9, c1=10, bg=RED)])
+        rules=[dict(formula='=$J2="Low data"', c0=0, c1=10, fg=GREY),
+               dict(formula='=AND($J2="OK",$I2>0)', c0=8, c1=9, bg=GREEN),
+               dict(formula='=AND($J2="OK",$I2<0)', c0=8, c1=9, bg=RED)])
 
 
 def _view_howto():

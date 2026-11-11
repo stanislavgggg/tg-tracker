@@ -78,6 +78,16 @@ def apply_view(sh, ws, spec: dict, n_rows: int):
             "range": rng(1, grid_rows, c, c + 1),
             "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "+0.0;-0.0;0.0"}}},
             "fields": "userEnteredFormat.numberFormat"}})
+    for c in spec.get("bold_cols", []):
+        reqs.append({"repeatCell": {
+            "range": rng(1, grid_rows, c, c + 1),
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat.bold"}})
+    for c in spec.get("tint_cols", []):
+        reqs.append({"repeatCell": {
+            "range": rng(1, grid_rows, c, c + 1),
+            "cell": {"userEnteredFormat": {"backgroundColor": _color((0.93, 0.95, 1.0))}},
+            "fields": "userEnteredFormat.backgroundColor"}})
     if spec.get("wrap_all"):
         reqs.append({"repeatCell": {
             "range": rng(1, grid_rows, 0, ncols),
