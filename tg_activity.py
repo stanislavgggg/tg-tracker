@@ -50,6 +50,10 @@ BACKFILL_PER_RUN = int(os.environ.get("ACTIVITY_BACKFILL_PER_RUN", "150"))
 # «Data quality = OK»: достаточно людей с известным статусом и достаточный охват (пороги выбраны мной, настраиваются)
 MIN_CHECKED = int(os.environ.get("ACTIVITY_MIN_CHECKED", "20"))
 MIN_COVERAGE = float(os.environ.get("ACTIVITY_MIN_COVERAGE", "50"))
+STAY_DAYS = 7  # «Stayed 7d»: не вышел из канала в течение 7 дней после вступления
+# Недельная когорта «созрела», когда с конца её недели прошло 7 дней: раньше «активен за 7 дней» верно для всех
+# просто потому, что человек вступил недавно (чтобы вступить, надо быть в Telegram).
+MATURE_AFTER_DAYS = 14  # от понедельника недели вступления
 
 ORGANIC = "unknown/organic"  # то же имя, что использует трекер
 NO_JOIN = "no join record"
@@ -73,11 +77,9 @@ SOURCE_HEADER = ["date", "channel", "link_name", "joined", "in_channel_now", "re
                  "active_7d_%_of_joined", "active_30d", "active_30d_%_of_checked", "hidden_%_of_checked"]
 
 COHORT_HEADER = ["Channel", "Link", "Joined in week starting (Mon)", "Joined", "Still in channel",
-                 "Still in %", "Status known %", "Active 7d %", "Active 30d %",
+                 "Still in %", "Stayed 7d %", "Status known %", "Active 7d %", "Active 30d %",
                  "vs channel avg (pp)", "Data quality"]
-SUMMARY_HEADER = ["Channel", "Link", "Joined last week", "Active 7d % (last week's cohort)",
-                  "Joined this week (so far)", "Active 7d % (this week's cohort)",
-                  "Change (pp)", "Data quality"]
+SUMMARY_FIXED = ["Channel", "Link"]
 
 _lock = None  # один Telegram-коннект за раз: два одновременных клиента на одной сессии её ломают
 
@@ -136,6 +138,10 @@ def init_tables(conn: sqlite3.Connection):
         user_id INTEGER PRIMARY KEY,
         ts      INTEGER NOT NULL,
         ok      INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS kv (
+        key   TEXT PRIMARY KEY,
+        value TEXT
     );
     CREATE TABLE IF NOT EXISTS chat_scan (
         chat_id INTEGER PRIMARY KEY,
@@ -263,6 +269,17 @@ async def _backfill_usernames(client, db_path, channel_ids, limit):
     if limit <= 0:
         return 0
     conn = sqlite3.connect(db_path)
+    now0 = int(time.time())
+    kv = dict(conn.execute("SELECT key, value FROM kv WHERE key IN ('backfill_block_until','backfill_last')"))
+    if now0 < int(kv.get("backfill_block_until", 0)):
+        conn.close()
+        log.info("Backfill: Telegram ограничил запросы по username, пропускаю до %s UTC",
+                 datetime.fromtimestamp(int(kv["backfill_block_until"]), timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        return 0
+    if now0 - int(kv.get("backfill_last", 0)) < 20 * 3600:  # не жечь лимит при повторных /activity
+        conn.close()
+        log.info("Backfill: уже запускался меньше 20 часов назад, пропускаю (лимит Telegram на username)")
+        return 0
     members = members_by_chat(conn, set(channel_ids))
     have = {r[0] for r in conn.execute("SELECT user_id FROM tg_users WHERE access_hash IS NOT NULL")}
     retry_after = int(time.time()) - 30 * 86400
@@ -276,6 +293,10 @@ async def _backfill_usernames(client, db_path, channel_ids, limit):
     todo = [u for u in want if u in uname and u not in have and u not in tried]
     todo.sort(key=lambda u: last_ts[u], reverse=True)  # сначала самые свежие
     now, done = int(time.time()), 0
+    conn = sqlite3.connect(db_path)
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO kv VALUES('backfill_last', ?)", (str(now),))
+    conn.close()
     for uid in todo[:limit]:
         ok, row = 0, None
         try:
@@ -287,6 +308,11 @@ async def _backfill_usernames(client, db_path, channel_ids, limit):
         except FloodWaitError as e:
             log.warning("Backfill: FloodWait %ss, остановлено, продолжим при следующем запуске (добрано %d)",
                         e.seconds, done)
+            conn = sqlite3.connect(db_path)
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO kv VALUES('backfill_block_until', ?)",
+                             (str(int(time.time()) + e.seconds + 120),))
+            conn.close()
             break
         except Exception:
             pass  # username сменился / не найден — пометим и не будем пробовать 30 дней
@@ -301,7 +327,7 @@ async def _backfill_usernames(client, db_path, channel_ids, limit):
             conn.execute("INSERT OR REPLACE INTO username_tried VALUES(?,?,?)", (uid, now, ok))
         conn.close()
         done += ok
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.5)
     log.info("Backfill по username: добрано %d из %d кандидатов (лимит за запуск %d)", done, len(todo), limit)
     return done
 
@@ -417,17 +443,33 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
         b = [status[u] for u in members.get(chat_id, ()) if u in status]
         if b:
             avg[chat_id] = pct(sum(1 for x in b if x in ACTIVE_7D), len(b))
+    # Stayed 7d по событиям трекера: считаем только тех, кто вступил не менее 7 дней назад
+    last_join, leaves = {}, {}
+    for chat_id, user_id, ev, _, ts in events:
+        if ev == "join":
+            last_join[(chat_id, user_id)] = ts
+        elif ev == "leave":
+            leaves.setdefault((chat_id, user_id), []).append(ts)
+    now_iso = datetime.now(timezone.utc)
+    stay_cut = (now_iso - timedelta(days=STAY_DAYS)).isoformat()
+    mature_week_max = (now_iso.date() - timedelta(days=MATURE_AFTER_DAYS)).isoformat()
     coh = {}
     for k, (name, ts) in attr.items():
-        g = coh.setdefault((k[0], name, _week_start(ts)), {"joined": 0, "now": set()})
+        g = coh.setdefault((k[0], name, _week_start(ts)), {"joined": 0, "now": set(), "m": 0, "stayed": 0})
         if k in joined:
             g["joined"] += 1
+            jt = last_join.get(k)
+            if jt and jt <= stay_cut:
+                g["m"] += 1
+                jt_end = (datetime.fromisoformat(jt) + timedelta(days=STAY_DAYS)).isoformat()
+                if not any(jt < lt <= jt_end for lt in leaves.get(k, [])):
+                    g["stayed"] += 1
         if k[1] in members.get(k[0], ()):
             g["now"].add(k[1])
     for chat_id, mem in members.items():
         for u in mem:
             if (chat_id, u) not in attr:
-                coh.setdefault((chat_id, ORGANIC, NO_JOIN), {"joined": 0, "now": set()})["now"].add(u)
+                coh.setdefault((chat_id, ORGANIC, NO_JOIN), {"joined": 0, "now": set(), "m": 0, "stayed": 0})["now"].add(u)
     coh_rows = []
     for (chat_id, name, wk), g in sorted(coh.items(), key=lambda kv: (label_fn(kv[0][0]), kv[0][1], kv[0][2])):
         now_u, jn = g["now"], g["joined"]
@@ -436,59 +478,81 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
         b = [status[u] for u in now_u if u in status]
         nn, n = len(now_u), len(b)
         cov = pct(n, nn)
-        ok = n >= MIN_CHECKED and cov >= MIN_COVERAGE
+        fresh = wk != NO_JOIN and wk > mature_week_max
+        ok = n >= MIN_CHECKED and cov >= MIN_COVERAGE and not fresh
         a7 = pct(sum(1 for x in b if x in ACTIVE_7D), n)
         a30 = pct(sum(1 for x in b if x in ACTIVE_30D), n)
         vs = round(a7 - avg[chat_id], 1) if ok and chat_id in avg else ""
+        stay = pct(g["stayed"], g["m"]) if g["m"] >= MIN_CHECKED else ""
+        quality = "Too fresh" if fresh else ("OK" if ok else "Low data")
         coh_rows.append([label_fn(chat_id), name, wk, jn, nn,
-                         pct(nn, jn) if jn and nn <= jn else "", cov, a7, a30, vs,
-                         "OK" if ok else "Low data"])
+                         pct(nn, jn) if jn and nn <= jn else "", stay, cov, a7, a30, vs, quality])
     return ch_rows, src_rows, coh_rows
 
 
-def build_summary(coh_rows):
-    """Для каждой ссылки: когорта прошлой недели против когорты этой недели (по неделе вступления)."""
+def summary_weeks():
+    """Две последние «созревшие» недели вступления: (старшая, младшая)."""
     today = datetime.now(timezone.utc).date()
-    this_wk = (today - timedelta(days=today.weekday())).isoformat()
-    last_wk = (today - timedelta(days=today.weekday() + 7)).isoformat()
+    newer = today - timedelta(days=MATURE_AFTER_DAYS)
+    newer = newer - timedelta(days=newer.weekday())  # понедельник последней созревшей недели
+    return (newer - timedelta(days=7)).isoformat(), newer.isoformat()
+
+
+def summary_header(old_wk, new_wk):
+    return ["Channel", "Link",
+            f"Joined (week {old_wk})", f"Stayed 7d % ({old_wk})", f"Active 7d % ({old_wk})",
+            f"Joined (week {new_wk})", f"Stayed 7d % ({new_wk})", f"Active 7d % ({new_wk})",
+            "Change: stayed (pp)", "Change: active (pp)", "Data quality"]
+
+
+def build_summary(coh_rows):
+    """Для каждой ссылки: две последние созревшие недели вступления рядом (честное сравнение одного возраста)."""
+    old_wk, new_wk = summary_weeks()
     by = {}
     for r in coh_rows:
-        if r[2] in (this_wk, last_wk):
+        if r[2] in (old_wk, new_wk):
             by.setdefault((r[0], r[1]), {})[r[2]] = r
     out = []
     for (ch, link), d in sorted(by.items()):
-        lw, tw = d.get(last_wk), d.get(this_wk)
-        ok = bool(lw and tw and lw[10] == "OK" and tw[10] == "OK")
-        change = round(tw[7] - lw[7], 1) if ok else ""
+        o, n = d.get(old_wk), d.get(new_wk)
+        ok = bool(o and n and o[11] == "OK" and n[11] == "OK")
+        dstay = round(n[6] - o[6], 1) if o and n and o[6] != "" and n[6] != "" else ""
+        dact = round(n[8] - o[8], 1) if ok else ""
         out.append([ch, link,
-                    lw[3] if lw else 0, lw[7] if lw else "",
-                    tw[3] if tw else 0, tw[7] if tw else "",
-                    change, "OK" if ok else "Low data"])
+                    o[3] if o else 0, o[6] if o else "", o[8] if o else "",
+                    n[3] if n else 0, n[6] if n else "", n[8] if n else "",
+                    dstay, dact, "OK" if ok else "Low data"])
     return out
 
 
 def howto_rows():
     return [[l] for l in [
         "WHAT THIS IS",
-        "For every invite link we look at the people who joined through it and check whether they still use Telegram. "
+        "For every invite link we look at the people who joined through it: did they stay, and do they still use Telegram. "
         "One invite link = one approach, so each row is the traffic quality of one approach in one join week.",
         "",
         "WHERE TO LOOK",
-        "Summary: each link, last week's cohort vs this week's cohort. Start here.",
+        "Summary: each link, the two latest mature weeks side by side. Start here.",
         "Cohorts: every link x every join week. Use the filter on the header row (channel, link).",
         "Activity Channels / Activity Sources: daily detail per channel and per link, for deeper digging.",
         "",
+        "WHY A WEEK'S TRAFFIC CAN BE JUDGED ONLY ~2 WEEKS LATER",
+        "A person who joined in the last 7 days was in Telegram in the last 7 days by definition, so 'Active 7d' is meaningless for fresh cohorts "
+        "(it shows ~100% for everyone). A week's cohort becomes comparable 14 days after the week starts. Until then the row is marked Too fresh and greyed out.",
+        "'Stayed 7d' (did not unsubscribe within 7 days after joining) is the quick signal: it is computed from join/leave events for everyone, with no Telegram lookup, "
+        "and it is the same age for every cohort, so it is a fair comparison.",
+        "",
         "HOW TO READ A ROW (tab Cohorts)",
-        "Joined: people who joined through this link in that week. Still in channel / Still in %: how many of them are still subscribed.",
-        "Status known %: for what share of the people still in the channel we know their last-seen status. This is the reliability of the row.",
+        "Joined: people who joined through this link in that week. Still in channel / Still in %: how many of them are still subscribed now.",
+        "Stayed 7d %: of those who joined at least 7 days ago, the share that did not leave within 7 days. Blank if there are too few people.",
+        "Status known %: for what share of the people still in the channel we know their last-seen status. This is the reliability of the Active columns.",
         "Active 7d % / Active 30d %: share of known people who were in Telegram in the last 7 / 30 days.",
         "vs channel avg (pp): this cohort's Active 7d % minus the whole channel's Active 7d %, in percentage points. Green = better than the channel, red = worse.",
-        "Data quality: OK means at least %d people with known status and at least %d%% of them known. Otherwise the row is greyed out and Low data: do not draw conclusions from it." % (MIN_CHECKED, MIN_COVERAGE),
+        "Data quality: OK = enough people with known status (at least %d, and at least %d%% of them known) and the cohort is mature. Low data or Too fresh rows are greyed out: do not draw conclusions from them." % (MIN_CHECKED, MIN_COVERAGE),
         "",
         "HOW TO COMPARE FAIRLY",
-        "Compare neighbouring weeks of the same link, or different links in the same week. A fresh cohort is almost always more active than an old one, so 'new vs. old' is not a fair comparison.",
+        "Compare neighbouring mature weeks of the same link, or different links in the same week.",
         "Keep the approach (landing, creative, audience) unchanged within a link. If the approach changes, create a new invite link, otherwise the cohort is mixed.",
-        "The current week is partial: it has fewer people.",
         "",
         "LIMITS",
         "Some people hide last seen: Telegram then gives only a rough bucket (recently / within a week / within a month / long ago). These are included, with their bucket.",
@@ -505,41 +569,46 @@ GREEN, RED, GREY = (0.85, 0.95, 0.85), (0.98, 0.84, 0.84), (0.6, 0.6, 0.6)
 
 def _view_cohorts():
     from tg_sheets_format import col_letter as L
-    q, v = L(10), L(9)
+    q, v = L(11), L(10)
     return dict(
-        ncols=11, index=2, tab_color=(0.2, 0.6, 0.35), freeze_cols=2, filter=True,
-        widths=[210, 200, 130, 80, 90, 85, 95, 90, 90, 110, 100],
-        percent_cols=[5, 6, 7, 8], pp_cols=[9],
+        ncols=12, index=2, tab_color=(0.2, 0.6, 0.35), freeze_cols=2, filter=True,
+        widths=[210, 200, 130, 80, 90, 85, 90, 95, 90, 90, 110, 100],
+        percent_cols=[5, 6, 7, 8, 9], pp_cols=[10],
         notes=["Telegram channel.", "Invite link name (one link = one approach).",
                "Monday of the week the people joined.",
                "People who joined via this link in that week.",
                "How many of them are still subscribed now.",
                "Still in channel / Joined. Blank if it is not reliable (more people than joined).",
-               "For what share of the people still in the channel we know last seen. Low = do not trust the percentages.",
-               "Share of known people in Telegram within the last 7 days (hidden last seen counted by Telegram's bucket).",
+               "Of those who joined at least 7 days ago: share that did not leave within 7 days. Same age for every cohort, so comparable. Blank if too few people.",
+               "For what share of the people still in the channel we know last seen. Low = do not trust the Active columns.",
+               "Share of known people in Telegram within the last 7 days. Meaningless for cohorts that joined in the last 7 days.",
                "Same for 30 days.",
                "This cohort's Active 7d % minus the whole channel's. Green = better than channel, red = worse. Only for OK rows.",
-               "OK = enough people with known status and enough coverage. Low data rows are greyed out."],
-        rules=[dict(formula=f'=${q}2="Low data"', c0=0, c1=11, fg=GREY),
-               dict(formula=f'=AND(${q}2="OK",${v}2>0)', c0=9, c1=10, bg=GREEN),
-               dict(formula=f'=AND(${q}2="OK",${v}2<0)', c0=9, c1=10, bg=RED)])
+               "OK = enough known people, enough coverage and a mature cohort. Too fresh = joined less than 14 days ago (Active is not comparable yet). Low data = too few known people."],
+        rules=[dict(formula=f'=OR(${q}2="Low data",${q}2="Too fresh")', c0=0, c1=12, fg=GREY),
+               dict(formula=f'=AND(${q}2="OK",${v}2>0)', c0=10, c1=11, bg=GREEN),
+               dict(formula=f'=AND(${q}2="OK",${v}2<0)', c0=10, c1=11, bg=RED)])
 
 
 def _view_summary():
-    from tg_sheets_format import col_letter as L
-    q, v = L(7), L(6)
     return dict(
-        ncols=8, index=1, tab_color=(0.2, 0.45, 0.8), freeze_cols=2, filter=True, header_height=64,
-        widths=[210, 200, 110, 150, 120, 150, 100, 100], percent_cols=[3, 5], pp_cols=[6],
-        notes=["Telegram channel.", "Invite link name.", "People who joined via this link last week.",
-               "Share of known people from last week's cohort who were in Telegram in the last 7 days.",
-               "People who joined via this link this week so far.",
-               "Same for this week's cohort. The week is partial, so there are fewer people.",
-               "This week minus last week, in percentage points. Green = this week is better.",
-               "OK only if both weeks have enough people with known status. Otherwise Low data."],
-        rules=[dict(formula=f'=${q}2="Low data"', c0=0, c1=8, fg=GREY),
-               dict(formula=f'=AND(${q}2="OK",${v}2>0)', c0=6, c1=7, bg=GREEN),
-               dict(formula=f'=AND(${q}2="OK",${v}2<0)', c0=6, c1=7, bg=RED)])
+        ncols=11, index=1, tab_color=(0.2, 0.45, 0.8), freeze_cols=2, filter=True, header_height=64,
+        widths=[210, 200, 100, 100, 100, 100, 100, 100, 105, 105, 100],
+        percent_cols=[3, 4, 6, 7], pp_cols=[8, 9],
+        notes=["Telegram channel.", "Invite link name.",
+               "People who joined via this link in the older of the two compared weeks.",
+               "Of those, share that did not leave within 7 days after joining.",
+               "Share of known people from that cohort in Telegram in the last 7 days (the cohort is mature, so this is meaningful).",
+               "People who joined via this link in the newer of the two compared weeks.",
+               "Same: stayed 7 days.", "Same: active in the last 7 days.",
+               "Newer minus older, in percentage points. Green = newer week is better.",
+               "Newer minus older, in percentage points. Only if both weeks have OK data.",
+               "OK only if both weeks have enough known people. Otherwise Low data."],
+        rules=[dict(formula='=$K2="Low data"', c0=0, c1=11, fg=GREY),
+               dict(formula='=AND($I2<>"",$I2>0)', c0=8, c1=9, bg=GREEN),
+               dict(formula='=AND($I2<>"",$I2<0)', c0=8, c1=9, bg=RED),
+               dict(formula='=AND($K2="OK",$J2>0)', c0=9, c1=10, bg=GREEN),
+               dict(formula='=AND($K2="OK",$J2<0)', c0=9, c1=10, bg=RED)])
 
 
 def _view_howto():
@@ -594,7 +663,8 @@ async def run(channel_ids, db_path, label_fn, export_fn) -> str:
     ch_rows, src_rows, coh_rows = await asyncio.to_thread(build_rows, db_path, day, label_fn, set(channel_ids))
     await export_fn(howto_rows(), tab=HOWTO_TAB, header=["How to read this file"], replace_all=True,
                     view=_view_howto())
-    await export_fn(build_summary(coh_rows), tab=SUMMARY_TAB, header=SUMMARY_HEADER, replace_all=True,
+    ow, nw = summary_weeks()
+    await export_fn(build_summary(coh_rows), tab=SUMMARY_TAB, header=summary_header(ow, nw), replace_all=True,
                     view=_view_summary())
     await export_fn(coh_rows, tab=COHORT_TAB, header=COHORT_HEADER, replace_all=True, view=_view_cohorts())
     await export_fn(ch_rows, tab=CHANNEL_TAB, header=CHANNEL_HEADER, replace_date=day,
