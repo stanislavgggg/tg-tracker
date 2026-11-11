@@ -241,7 +241,8 @@ async def post_to_slack(text: str):
 
 # ---------- Google Sheets ----------
 def _sheets_append_sync(tab: str, header: list[str], rows: list[list],
-                        replace_date: str | None = None, replace_all: bool = False):
+                        replace_date: str | None = None, replace_all: bool = False,
+                        view: dict | None = None):
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -285,18 +286,25 @@ def _sheets_append_sync(tab: str, header: list[str], rows: list[list],
             log.info("Sheets [%s]: replaced %d existing row(s) for %s",
                      tab, len(idx), replace_date)
     ws.append_rows(rows, value_input_option="RAW")
+    if view:
+        try:
+            import tg_sheets_format
+            tg_sheets_format.apply_view(sh, ws, view, len(rows) + 1)
+        except Exception as e:  # оформление не должно ломать запись данных
+            log.warning("Sheets [%s]: formatting failed: %r", tab, e)
 
 
 async def export_to_sheets(rows: list[list], tab: str | None = None,
                            header: list[str] | None = None,
-                           replace_date: str | None = None, replace_all: bool = False):
+                           replace_date: str | None = None, replace_all: bool = False,
+                           view: dict | None = None):
     if not GSHEET_ID:
         log.info("GSHEET_ID not configured, skipping")
         return
     tab = tab or SHEET_TAB
     header = header or ["date", "channel", "link_name", "joins", "leaves", "net", "requests"]
     try:
-        await asyncio.to_thread(_sheets_append_sync, tab, header, rows, replace_date, replace_all)
+        await asyncio.to_thread(_sheets_append_sync, tab, header, rows, replace_date, replace_all, view)
         log.info("Sheets [%s]: appended %d rows", tab, len(rows))
     except Exception as e:
         log.exception("Sheets export failed (%s): %r", type(e).__name__, e)
