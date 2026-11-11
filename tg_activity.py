@@ -9,9 +9,12 @@
   2. Раз в сутки перепроверяем last seen у всех накопленных людей ПОИМЁННО (users.getUsers по
      сохранённым ключам) — в том числе у тех, кто давно вышел из окна.
   3. Кто сейчас в канале, берём из событий трекера (таблица events: join/leave) плюс текущее окно.
-  4. Склеиваем с events: человек -> ссылка, по которой вступил. Пишем две вкладки в тот же Google-файл:
+  4. Старых людей (вступивших до запуска, уже не в окне) добираем по публичному username из events
+     (contacts.resolveUsername отдаёт и ключ, и статус) — понемногу за запуск из-за лимитов Telegram.
+  5. Склеиваем с events: человек -> ссылка и неделя вступления. Пишем три вкладки в тот же Google-файл:
         Activity Channels  — по дням и каналам
-        Activity Sources   — по дням, каналам и ссылкам (когорты по ссылкам)
+        Activity Sources   — по дням, каналам и ссылкам
+        Activity Cohorts   — ссылка × неделя вступления (текущее состояние, перезаписывается целиком)
 Охват честный: в каждой строке есть checked (у скольких знаем статус) и coverage_%.
 Считаются люди, вступившие с момента запуска модуля (+ окно на момент первого скана).
 
@@ -20,6 +23,7 @@ Env (если не заданы API_ID / API_HASH / SESSION_STRING — моду�
     SESSION_STRING          python activity_login.py (отдельный аккаунт, админ каналов)
     ACTIVITY_HOUR           час ежедневной перепроверки и записи в Sheets, REPORT_TZ, default 10
     ACTIVITY_SCAN_HOURS     как часто читать окно новых подписчиков, default 6
+    ACTIVITY_BACKFILL_PER_RUN  сколько старых людей добирать по username за ежедневный запуск, default 150
     ACTIVITY_WINDOW_DAYS    в Activity Sources учитывать вступивших за последние N дней, 0 = за всё время
 """
 import asyncio
@@ -38,10 +42,12 @@ ENABLED = bool(API_ID and API_HASH and SESSION_STRING)
 ACTIVITY_HOUR = int(os.environ.get("ACTIVITY_HOUR", "10"))
 SCAN_HOURS = float(os.environ.get("ACTIVITY_SCAN_HOURS", "6"))
 WINDOW_DAYS = int(os.environ.get("ACTIVITY_WINDOW_DAYS", "0"))
+BACKFILL_PER_RUN = int(os.environ.get("ACTIVITY_BACKFILL_PER_RUN", "150"))
 
 ORGANIC = "unknown/organic"  # то же имя, что использует трекер
 CHANNEL_TAB = "Activity Channels"
 SOURCE_TAB = "Activity Sources"
+COHORT_TAB = "Activity Cohorts"
 
 # «активен» — определение можно менять здесь
 ACTIVE_7D = {"online", "d1", "d7", "h_recently", "h_week"}
@@ -54,6 +60,10 @@ CHANNEL_HEADER = ["date", "channel", "tracked_members", "checked", "coverage_%",
                   "active_7d", "active_7d_%", "active_30d", "active_30d_%", "hidden_%"]
 SOURCE_HEADER = ["date", "channel", "link_name", "joined", "in_channel_now", "retained_%",
                  "checked", "coverage_%", "active_7d", "active_7d_%_of_checked",
+                 "active_7d_%_of_joined", "active_30d", "active_30d_%_of_checked", "hidden_%_of_checked"]
+
+COHORT_HEADER = ["snapshot", "channel", "link_name", "join_week_start", "joined", "in_channel_now",
+                 "retained_%", "checked", "coverage_%", "active_7d", "active_7d_%_of_checked",
                  "active_7d_%_of_joined", "active_30d", "active_30d_%_of_checked", "hidden_%_of_checked"]
 
 _lock = None  # один Telegram-коннект за раз: два одновременных клиента на одной сессии её ломают
@@ -108,6 +118,11 @@ def init_tables(conn: sqlite3.Connection):
         chat_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
         PRIMARY KEY (chat_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS username_tried (   -- попытки добора по username
+        user_id INTEGER PRIMARY KEY,
+        ts      INTEGER NOT NULL,
+        ok      INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS chat_scan (
         chat_id INTEGER PRIMARY KEY,
@@ -227,6 +242,57 @@ async def _recheck(client, db_path, user_ids, skip_fresh_after):
     return updated
 
 
+async def _backfill_usernames(client, db_path, channel_ids, limit):
+    """Добирает ключи и статусы старых людей по публичному username (из events).
+    Только для тех, кто сейчас в канале и ещё не в tg_users. Останавливается на FloodWait: продолжим завтра."""
+    from telethon import types
+    from telethon.errors import FloodWaitError
+    if limit <= 0:
+        return 0
+    conn = sqlite3.connect(db_path)
+    members = members_by_chat(conn, set(channel_ids))
+    have = {r[0] for r in conn.execute("SELECT user_id FROM tg_users WHERE access_hash IS NOT NULL")}
+    retry_after = int(time.time()) - 30 * 86400
+    tried = {r[0] for r in conn.execute("SELECT user_id FROM username_tried WHERE ts > ?", (retry_after,))}
+    uname, last_ts = {}, {}
+    for uid, un, ts in conn.execute(
+            "SELECT user_id, username, ts FROM events WHERE username IS NOT NULL AND username != '' ORDER BY ts"):
+        uname[uid], last_ts[uid] = un, ts
+    conn.close()
+    want = set().union(*members.values()) if members else set()
+    todo = [u for u in want if u in uname and u not in have and u not in tried]
+    todo.sort(key=lambda u: last_ts[u], reverse=True)  # сначала самые свежие
+    now, done = int(time.time()), 0
+    for uid in todo[:limit]:
+        ok, row = 0, None
+        try:
+            ent = await client.get_entity(uname[uid])
+            if isinstance(ent, types.User) and ent.id == uid:
+                b, seen = bucket_of(ent.status, now)
+                row = (uid, ent.access_hash, int(bool(ent.bot)), int(bool(ent.deleted)), b, seen, now, now)
+                ok = 1
+        except FloodWaitError as e:
+            log.warning("Backfill: FloodWait %ss, остановлено, продолжим при следующем запуске (добрано %d)",
+                        e.seconds, done)
+            break
+        except Exception:
+            pass  # username сменился / не найден — пометим и не будем пробовать 30 дней
+        conn = sqlite3.connect(db_path)
+        with conn:
+            if row:
+                conn.execute(
+                    """INSERT INTO tg_users(user_id, access_hash, is_bot, is_deleted, bucket,
+                                            last_seen_ts, status_ts, first_seen_ts) VALUES(?,?,?,?,?,?,?,?)
+                       ON CONFLICT(user_id) DO UPDATE SET access_hash=excluded.access_hash,
+                         bucket=excluded.bucket, last_seen_ts=excluded.last_seen_ts, status_ts=excluded.status_ts""", row)
+            conn.execute("INSERT OR REPLACE INTO username_tried VALUES(?,?,?)", (uid, now, ok))
+        conn.close()
+        done += ok
+        await asyncio.sleep(1.5)
+    log.info("Backfill по username: добрано %d из %d кандидатов (лимит за запуск %d)", done, len(todo), limit)
+    return done
+
+
 # ---------- кто сейчас в канале ----------
 def _events(conn, chat_ids):
     q = ("SELECT chat_id, user_id, event, link_name, ts FROM events "
@@ -271,6 +337,11 @@ def _attribution(events):
         elif ev == "join":
             attr[k] = (cur[0], ts)
     return attr, joined
+
+
+def _week_start(ts_iso: str) -> str:
+    d = datetime.fromisoformat(ts_iso).astimezone(timezone.utc).date()
+    return (d - timedelta(days=d.weekday())).isoformat()  # понедельник недели вступления
 
 
 # ---------- агрегаты ----------
@@ -327,7 +398,32 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
         src_rows.append([day, label_fn(chat_id), name, jn, nn,
                          pct(nn, jn) if jn and nn <= jn else "", n, pct(n, nn), a7, pct(a7, n),
                          pct(a7, jn) if jn else "", a30, pct(a30, n), pct(hid, n)])
-    return ch_rows, src_rows
+    # --- ссылка × неделя вступления ---
+    coh = {}
+    for k, (name, ts) in attr.items():
+        g = coh.setdefault((k[0], name, _week_start(ts)), {"joined": 0, "now": set()})
+        if k in joined:
+            g["joined"] += 1
+        if k[1] in members.get(k[0], ()):
+            g["now"].add(k[1])
+    for chat_id, mem in members.items():
+        for u in mem:
+            if (chat_id, u) not in attr:
+                coh.setdefault((chat_id, ORGANIC, "no_join_event"), {"joined": 0, "now": set()})["now"].add(u)
+    coh_rows = []
+    for (chat_id, name, wk), g in sorted(coh.items(), key=lambda kv: (label_fn(kv[0][0]), kv[0][1], kv[0][2])):
+        now_u, jn = g["now"], g["joined"]
+        if not jn and not now_u:
+            continue
+        b = [status[u] for u in now_u if u in status]
+        nn, n = len(now_u), len(b)
+        a7 = sum(1 for x in b if x in ACTIVE_7D)
+        a30 = sum(1 for x in b if x in ACTIVE_30D)
+        hid = sum(1 for x in b if x.startswith("h_"))
+        coh_rows.append([day, label_fn(chat_id), name, wk, jn, nn,
+                         pct(nn, jn) if jn and nn <= jn else "", n, pct(n, nn), a7, pct(a7, n),
+                         pct(a7, jn) if jn else "", a30, pct(a30, n), pct(hid, n)])
+    return ch_rows, src_rows, coh_rows
 
 
 # ---------- публичные точки входа ----------
@@ -362,12 +458,17 @@ async def run(channel_ids, db_path, label_fn, export_fn) -> str:
             conn = sqlite3.connect(db_path)
             members = members_by_chat(conn, set(channel_ids))
             conn.close()
+            backfilled = await _backfill_usernames(client, db_path, channel_ids, BACKFILL_PER_RUN)
+            conn = sqlite3.connect(db_path)
+            members = members_by_chat(conn, set(channel_ids))
+            conn.close()
             all_members = set().union(*members.values()) if members else set()
             rechecked = await _recheck(client, db_path, all_members, started)
-    ch_rows, src_rows = await asyncio.to_thread(build_rows, db_path, day, label_fn, set(channel_ids))
+    ch_rows, src_rows, coh_rows = await asyncio.to_thread(build_rows, db_path, day, label_fn, set(channel_ids))
     await export_fn(ch_rows, tab=CHANNEL_TAB, header=CHANNEL_HEADER, replace_date=day)
     await export_fn(src_rows, tab=SOURCE_TAB, header=SOURCE_HEADER, replace_date=day)
-    lines = [f"📶 Активность подписчиков, {day} (перепроверено поимённо: {rechecked}):"]
+    await export_fn(coh_rows, tab=COHORT_TAB, header=COHORT_HEADER, replace_all=True)
+    lines = [f"📶 Активность подписчиков, {day} (перепроверено поимённо: {rechecked}, добрано по username: {backfilled}):"]
     for r in ch_rows:
         lines.append(f"• {r[1]}: отслеживается {r[2]:,}, охват {r[4]}%, активны 7д {r[15]}%, 30д {r[17]}%")
     if failed:
