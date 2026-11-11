@@ -541,6 +541,7 @@ async def daily_report_scheduler():
 
 
 async def activity_scheduler():
+    """Ежедневно: скан окон + перепроверка всех накопленных людей + запись в Google Sheets."""
     while True:
         now = datetime.now(REPORT_TZ)
         next_run = now.replace(hour=tg_activity.ACTIVITY_HOUR, minute=0, second=0, microsecond=0)
@@ -553,6 +554,17 @@ async def activity_scheduler():
             await tg_activity.run(CHANNEL_IDS, DB_PATH, chan_label, export_to_sheets)
         except Exception as e:
             log.exception("Activity snapshot failed: %s", e)
+
+
+async def activity_scan_scheduler():
+    """Несколько раз в день читает «окно» новых подписчиков, чтобы не потерять никого из вступивших."""
+    await asyncio.sleep(90)  # дать боту стартовать
+    while True:
+        try:
+            await tg_activity.scan_only(CHANNEL_IDS, DB_PATH, chan_label)
+        except Exception as e:
+            log.exception("Activity scan failed: %s", e)
+        await asyncio.sleep(tg_activity.SCAN_HOURS * 3600)
 
 
 async def run_evening_report():
@@ -988,7 +1000,7 @@ Stats
 /members — current subscriber totals per channel
 /channels — tracked channels and their chat IDs
 /audit [days] — integrity check: unnamed links, idle links, untracked channels, gaps
-/activity — snapshot of subscribers' last seen -> Sheets tabs Activity / Activity by Source
+/activity — snapshot of subscribers' last seen -> Sheets tabs Activity Channels / Activity Sources
 
 Reports to Slack
 /report — yesterday's report (Slack + Google Sheets)
@@ -1003,7 +1015,7 @@ Automatic: daily report at {rh}:00 ({tz}), intraday every {ih}h.
 
 @dp.message(Command("activity"))
 async def cmd_activity(msg: Message):
-    """Снимок last seen подписчиков прямо сейчас -> вкладки Activity / Activity by Source."""
+    """Снимок last seen подписчиков прямо сейчас -> вкладки Activity Channels / Activity Sources."""
     if not is_admin(msg):
         return
     if not tg_activity.ENABLED:
@@ -1157,8 +1169,10 @@ async def main():
     if EVENING_HOUR >= 0:
         asyncio.create_task(evening_report_scheduler())
     if tg_activity.ENABLED:
-        log.info("Activity snapshots enabled: daily at %02d:00 %s", tg_activity.ACTIVITY_HOUR, REPORT_TZ)
+        log.info("Activity enabled: window scan every %s h, daily snapshot at %02d:00 %s",
+                 tg_activity.SCAN_HOURS, tg_activity.ACTIVITY_HOUR, REPORT_TZ)
         asyncio.create_task(activity_scheduler())
+        asyncio.create_task(activity_scan_scheduler())
     if INTRADAY_HOURS > 0:
         log.info("Intraday Slack report enabled: every %d h", INTRADAY_HOURS)
         asyncio.create_task(intraday_report_scheduler())
