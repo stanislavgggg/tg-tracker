@@ -36,6 +36,20 @@ def apply_view(sh, ws, spec: dict, n_rows: int):
         if s["properties"]["sheetId"] == sid:
             n_old = len(s.get("conditionalFormats", []))
     reqs = [{"deleteConditionalFormatRule": {"sheetId": sid, "index": 0}} for _ in range(n_old)]
+    # сбросить ВСЁ старое оформление листа (ws.clear() стирает только значения): иначе числовой формат
+    # прошлой раскладки колонок «прилипает» к новым колонкам (счётчик показывался как «55.0%»)
+    reqs.append({"repeatCell": {"range": {"sheetId": sid}, "cell": {}, "fields": "userEnteredFormat"}})
+
+    # сгруппированные колонки: убрать прошлые группы (иначе вложатся друг в друга), затем создать заново
+    for s_ in sh.fetch_sheet_metadata().get("sheets", []):
+        if s_["properties"]["sheetId"] == sid:
+            for g in sorted(s_.get("columnGroups", []), key=lambda g: -g.get("depth", 1)):
+                reqs.append({"deleteDimensionGroup": {"range": g["range"]}})
+    for c0, c1 in spec.get("col_groups", []):
+        r_ = {"sheetId": sid, "dimension": "COLUMNS", "startIndex": c0, "endIndex": c1}
+        reqs.append({"addDimensionGroup": {"range": r_}})
+        reqs.append({"updateDimensionGroup": {"dimensionGroup": {"range": r_, "depth": 1, "collapsed": True},
+                                              "fields": "collapsed"}})
 
     # 2) закрепление, цвет и положение вкладки
     props = {"sheetId": sid, "gridProperties": {

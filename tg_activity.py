@@ -11,11 +11,10 @@
   3. Кто сейчас в канале, берём из событий трекера (таблица events: join/leave) плюс текущее окно.
   4. Старых людей (вступивших до запуска, уже не в окне) добираем по публичному username из events
      (contacts.resolveUsername отдаёт и ключ, и статус) — понемногу за запуск из-за лимитов Telegram.
-  5. Склеиваем с events: человек -> ссылка и неделя вступления. Пишем три вкладки в тот же Google-файл:
+  5. Склеиваем с events: человек -> ссылка и неделя вступления. Пишем вкладки в тот же Google-файл:
         Activity Channels  — по дням и каналам
         Activity Sources   — по дням, каналам и ссылкам
         Cohorts            — ссылка × неделя вступления (читаемый вид, перезаписывается целиком)
-        Summary            — по каждой ссылке: когорта прошлой недели против этой
         How to read        — инструкция внутри файла
 Охват честный: в каждой строке есть checked (у скольких знаем статус) и coverage_%.
 Считаются люди, вступившие с момента запуска модуля (+ окно на момент первого скана).
@@ -60,7 +59,6 @@ NO_JOIN = "no join record"
 CHANNEL_TAB = "Activity Channels"
 SOURCE_TAB = "Activity Sources"
 COHORT_TAB = "Cohorts"
-SUMMARY_TAB = "Summary"
 HOWTO_TAB = "How to read"
 
 # «активен» — определение можно менять здесь
@@ -76,10 +74,11 @@ SOURCE_HEADER = ["date", "channel", "link_name", "joined", "in_channel_now", "re
                  "checked", "coverage_%", "active_7d", "active_7d_%_of_checked",
                  "active_7d_%_of_joined", "active_30d", "active_30d_%_of_checked", "hidden_%_of_checked"]
 
-COHORT_HEADER = ["Channel", "Link", "Joined in week starting (Mon)", "Joined", "★ Alive 7d % (North Star)",
-                 "Still in channel", "Still in %", "Stayed 7d %", "Status known %", "Active 7d %", "Active 30d %",
-                 "Data quality"]
-SUMMARY_FIXED = ["Channel", "Link"]
+Q_OK, Q_EARLY, Q_LOW = "Reliable", "Too early", "Not enough data"
+COHORT_HEADER = ["Channel", "Invite link", "Join week (Mon)", "Joined",
+                 "★ Subscribed & active % (main metric)", "★ Change vs previous (pp)", "Can I trust this row?",
+                 "Still subscribed (people)", "Still subscribed %", "Didn't leave in first 7 days %",
+                 "Activity checked %", "Active last 7 days %", "Active last 30 days %"]
 
 _lock = None  # один Telegram-коннект за раз: два одновременных клиента на одной сессии её ломают
 
@@ -436,7 +435,7 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
         hid = sum(1 for x in b if x.startswith("h_"))
         src_rows.append([day, label_fn(chat_id), name, jn, nn,
                          pct(nn, jn) if jn and nn <= jn else "", n, pct(n, nn), a7, pct(a7, n),
-                         pct(a7, jn) if jn else "", a30, pct(a30, n), pct(hid, n)])
+                         pct(a7, jn) if jn and nn <= jn else "", a30, pct(a30, n), pct(hid, n)])
     # --- ссылка × неделя вступления (читаемый вид) ---
     # Stayed 7d по событиям трекера: считаем только тех, кто вступил не менее 7 дней назад
     last_join, leaves = {}, {}
@@ -466,6 +465,7 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
             if (chat_id, u) not in attr:
                 coh.setdefault((chat_id, ORGANIC, NO_JOIN), {"joined": 0, "now": set(), "m": 0, "stayed": 0})["now"].add(u)
     coh_rows = []
+    prev_star = {}
     for (chat_id, name, wk), g in sorted(coh.items(), key=lambda kv: (label_fn(kv[0][0]), kv[0][1], kv[0][2])):
         now_u, jn = g["now"], g["joined"]
         if not jn and not now_u:
@@ -478,126 +478,87 @@ def build_rows(db_path: str, day: str, label_fn, chat_ids):
         a7 = pct(sum(1 for x in b if x in ACTIVE_7D), n)
         a30 = pct(sum(1 for x in b if x in ACTIVE_30D), n)
         stay = pct(g["stayed"], g["m"]) if g["m"] >= MIN_CHECKED else ""
-        quality = "Too fresh" if fresh else ("OK" if ok else "Low data")
-        # North Star: из ВСЕХ вступивших по ссылке за неделю — сколько сейчас подписаны И активны за 7 дней.
-        # = Still in % × Active 7d %. Для «Too fresh» когорт бессмысленна (активны по определению) — пусто.
+        quality = Q_EARLY if fresh else (Q_OK if ok else Q_LOW)
+        # ★ Subscribed & active % (main metric): из ВСЕХ вступивших по ссылке за неделю — сколько сейчас подписаны И активны за 7 дней.
+        # = Still subscribed % × Active last 7 days %. Для «Too early» когорт бессмысленна (активны по определению) — пусто.
         star = round(a7 * nn / jn, 1) if jn and 0 < n and nn <= jn and not fresh else ""
-        coh_rows.append([label_fn(chat_id), name, wk, jn, star, nn,
-                         pct(nn, jn) if jn and nn <= jn else "", stay, cov, a7, a30, quality])
+        # изменение к предыдущей НАДЁЖНОЙ неделе той же ссылки (строки идут по неделям по возрастанию)
+        label = label_fn(chat_id)
+        change = ""
+        if quality == Q_OK and star != "" and (label, name) in prev_star:
+            change = round(star - prev_star[(label, name)], 1)
+        if quality == Q_OK and star != "":
+            prev_star[(label, name)] = star
+        coh_rows.append([label, name, wk, jn, star, change, quality,
+                         nn, pct(nn, jn) if jn and nn <= jn else "", stay, cov, a7, a30])
     return ch_rows, src_rows, coh_rows
-
-
-def summary_weeks():
-    """Две последние «созревшие» недели вступления: (старшая, младшая)."""
-    today = datetime.now(timezone.utc).date()
-    newer = today - timedelta(days=MATURE_AFTER_DAYS)
-    newer = newer - timedelta(days=newer.weekday())  # понедельник последней созревшей недели
-    return (newer - timedelta(days=7)).isoformat(), newer.isoformat()
-
-
-def summary_header(old_wk, new_wk):
-    return ["Channel", "Link",
-            f"Joined (week {old_wk})", f"Stayed 7d % ({old_wk})", f"★ Alive 7d % ({old_wk})",
-            f"Joined (week {new_wk})", f"Stayed 7d % ({new_wk})", f"★ Alive 7d % ({new_wk})",
-            "Change ★ (pp)", "Data quality"]
-
-
-def build_summary(coh_rows):
-    """Для каждой ссылки: две последние созревшие недели вступления рядом (честное сравнение одного возраста)."""
-    old_wk, new_wk = summary_weeks()
-    by = {}
-    for r in coh_rows:
-        if r[2] in (old_wk, new_wk):
-            by.setdefault((r[0], r[1]), {})[r[2]] = r
-    out = []
-    for (ch, link), d in sorted(by.items()):
-        o, n = d.get(old_wk), d.get(new_wk)
-        ok = bool(o and n and o[11] == "OK" and n[11] == "OK" and o[4] != "" and n[4] != "")
-        out.append([ch, link,
-                    o[3] if o else 0, o[7] if o else "", o[4] if o else "",
-                    n[3] if n else 0, n[7] if n else "", n[4] if n else "",
-                    round(n[4] - o[4], 1) if ok else "", "OK" if ok else "Low data"])
-    return out
 
 
 def howto_rows():
     return [[l] for l in [
         "WHAT THIS IS",
-        "For every invite link we look at the people who joined through it: did they stay, and do they still use Telegram. "
-        "One invite link = one approach, so each row is the traffic quality of one approach in one join week.",
+        "For every invite link we look at the people who joined through it: did they stay, and are they still active in Telegram. "
+        "One invite link = one approach, so every row is the quality of one approach in one join week.",
         "",
-        "WHERE TO LOOK",
-        "Summary: each link, the two latest mature weeks side by side, with the change in the North Star. Start here.",
-        "Cohorts: every link x every join week. Use the filter on the header row (channel, link).",
-        "Activity Channels / Activity Sources: daily detail per channel and per link, for deeper digging.",
+        "HOW TO READ THE TAB 'Cohorts'",
+        "One row = one invite link in one week. Look at the first columns only:",
+        "★ Subscribed & active % (main metric) = of everyone who joined through the link that week, the share who are still subscribed AND were active in Telegram in the last 7 days. "
+        "This is the one number to judge quality by. Higher is better.",
+        "★ Change vs previous (pp) = how this week differs from the previous reliable week of the same link, in percentage points. Green = better, red = worse.",
+        "Can I trust this row? Reliable = go ahead. Too early = joined less than 14 days ago, wait. Not enough data = too few people checked yet. "
+        "Grey rows are not reliable: do not draw conclusions from them.",
+        "Click the + above the columns (or the small arrow) to open the extra detail: how many are still subscribed, how many left in the first 7 days, "
+        "for how many we could check activity, and activity over 7 and 30 days.",
+        "Use the filter arrows on the header: for example, filter 'Can I trust this row?' = Reliable, or pick one channel or link.",
         "",
-        "WHY A WEEK'S TRAFFIC CAN BE JUDGED ONLY ~2 WEEKS LATER",
-        "A person who joined in the last 7 days was in Telegram in the last 7 days by definition, so 'Active 7d' is meaningless for fresh cohorts "
-        "(it shows ~100% for everyone). A week's cohort becomes comparable 14 days after the week starts. Until then the row is marked Too fresh and greyed out.",
-        "'Stayed 7d' (did not unsubscribe within 7 days after joining) is the quick signal: it is computed from join/leave events for everyone, with no Telegram lookup, "
-        "and it is the same age for every cohort, so it is a fair comparison.",
+        "WHY WE WAIT ABOUT 2 WEEKS",
+        "A person who joined in the last 7 days was in Telegram in the last 7 days by definition, so activity looks like ~100% for fresh cohorts and says nothing. "
+        "A week's cohort becomes comparable 14 days after the week starts. Until then the row is 'Too early'.",
+        "Old cohorts fill in gradually, because Telegram limits how many old subscribers can be checked per day.",
         "",
-        "HOW TO READ A ROW (tab Cohorts)",
-        "Joined: people who joined through this link in that week. Still in channel / Still in %: how many of them are still subscribed now.",
-        "Stayed 7d %: of those who joined at least 7 days ago, the share that did not leave within 7 days. Blank if there are too few people.",
-        "Status known %: for what share of the people still in the channel we know their last-seen status. This is the reliability of the Active columns.",
-        "Active 7d % / Active 30d %: share of known people who were in Telegram in the last 7 / 30 days.",
-        "★ Alive 7d % (North Star): of EVERYONE who joined through this link that week, the share who are still subscribed AND were in Telegram in the last 7 days. "
-        "It equals Still in % x Active 7d %. One number for the whole picture: losing people lowers it, and keeping people who are inactive also lowers it. Higher is better. Empty for Too fresh cohorts.",
-        "Data quality: OK = enough people with known status (at least %d, and at least %d%% of them known) and the cohort is mature. Low data or Too fresh rows are greyed out: do not draw conclusions from them." % (MIN_CHECKED, MIN_COVERAGE),
+        "REQUIREMENTS FOR 'Reliable'",
+        "At least %d people with a known status, activity checked for at least %d%% of the subscribers still in the channel, and the cohort is at least 14 days old." % (MIN_CHECKED, MIN_COVERAGE),
         "",
         "HOW TO COMPARE FAIRLY",
-        "Compare neighbouring mature weeks of the same link, or different links in the same week.",
+        "Compare neighbouring reliable weeks of the same link, or different links in the same week.",
         "Keep the approach (landing, creative, audience) unchanged within a link. If the approach changes, create a new invite link, otherwise the cohort is mixed.",
         "",
         "LIMITS",
-        "Some people hide last seen: Telegram then gives only a rough bucket (recently / within a week / within a month / long ago). These are included, with their bucket.",
-        "Active in Telegram does not mean reads our channel.",
-        "People who joined before the tracker started are only partly visible. Coverage grows over the first days.",
+        "Some people hide last seen: Telegram then gives only a rough bucket (recently / within a week / within a month / long ago). These are included with their bucket.",
+        "Active in Telegram does not mean the person reads our channel.",
+        "People who joined before the tracker started are only partly visible.",
         "'no join record' in the week column = subscribers we have no join event for (organic or joined before the tracker).",
         "Weeks are by the date of the person's last join event, in UTC.",
+        "",
+        "OTHER TABS",
+        "Activity Channels / Activity Sources: daily detail per channel and per link, for deeper digging.",
     ]]
 
 
-# ---------- оформление вкладок ----------
 GREEN, RED, GREY = (0.85, 0.95, 0.85), (0.98, 0.84, 0.84), (0.6, 0.6, 0.6)
 
 
 def _view_cohorts():
     return dict(
-        ncols=12, index=2, tab_color=(0.2, 0.6, 0.35), freeze_cols=2, filter=True,
-        widths=[210, 200, 130, 80, 120, 90, 85, 90, 95, 90, 90, 100],
-        percent_cols=[4, 6, 7, 8, 9, 10], bold_cols=[4], tint_cols=[4],
+        ncols=13, index=1, tab_color=(0.2, 0.6, 0.35), freeze_cols=2, filter=True, header_height=64,
+        widths=[200, 190, 120, 75, 125, 120, 130, 110, 100, 130, 105, 105, 105],
+        percent_cols=[4, 8, 9, 10, 11, 12], pp_cols=[5], bold_cols=[4], tint_cols=[4],
+        col_groups=[(7, 13)],  # детали свёрнуты под «+», разворачиваются по клику
         notes=["Telegram channel.", "Invite link name (one link = one approach).",
                "Monday of the week the people joined.",
-               "People who joined via this link in that week.",
-               "North Star. Of everyone who joined via this link that week: share still subscribed AND active in Telegram in the last 7 days. = Still in % x Active 7d %. Higher is better. Empty for Too fresh cohorts.",
+               "People who joined through this link in that week.",
+               "Main metric. Of everyone who joined through this link that week: share still subscribed AND active in Telegram in the last 7 days. Higher is better. Empty if the row is too early.",
+               "This week's main metric minus the previous reliable week of the same link, in percentage points. Green = better, red = worse. Only between two reliable rows.",
+               "Reliable = enough data, you can use it. Too early = joined less than 14 days ago, wait. Not enough data = too few people checked yet.",
                "How many of them are still subscribed now.",
-               "Still in channel / Joined. Blank if it is not reliable (more people than joined).",
-               "Of those who joined at least 7 days ago: share that did not leave within 7 days. Same age for every cohort, so comparable. Blank if too few people.",
-               "For what share of the people still in the channel we know last seen. Low = do not trust the Active columns.",
-               "Share of known people in Telegram within the last 7 days. Meaningless for cohorts that joined in the last 7 days.",
-               "Same for 30 days.",
-               "OK = enough known people, enough coverage and a mature cohort. Too fresh = joined less than 14 days ago (Active is not comparable yet). Low data = too few known people."],
-        rules=[dict(formula='=OR($L2="Low data",$L2="Too fresh")', c0=0, c1=12, fg=GREY)])
-
-
-def _view_summary():
-    return dict(
-        ncols=10, index=1, tab_color=(0.2, 0.45, 0.8), freeze_cols=2, filter=True, header_height=64,
-        widths=[210, 200, 100, 100, 110, 100, 100, 110, 105, 100],
-        percent_cols=[3, 4, 6, 7], pp_cols=[8], bold_cols=[4, 7], tint_cols=[4, 7],
-        notes=["Telegram channel.", "Invite link name.",
-               "People who joined via this link in the older of the two compared weeks.",
-               "Of those, share that did not leave within 7 days after joining.",
-               "North Star of the older week: of everyone who joined, share still subscribed AND active in Telegram in the last 7 days.",
-               "People who joined via this link in the newer of the two compared weeks.",
-               "Same: stayed 7 days.", "North Star of the newer week.",
-               "Newer minus older North Star, in percentage points. Green = newer week is better. Only if both weeks have OK data.",
-               "OK only if both weeks have enough known people. Otherwise Low data."],
-        rules=[dict(formula='=$J2="Low data"', c0=0, c1=10, fg=GREY),
-               dict(formula='=AND($J2="OK",$I2>0)', c0=8, c1=9, bg=GREEN),
-               dict(formula='=AND($J2="OK",$I2<0)', c0=8, c1=9, bg=RED)])
+               "Still subscribed / Joined. Blank if not reliable (more people than joined).",
+               "Of those who joined at least 7 days ago: share that did not leave within 7 days. Same age for every cohort. Blank if too few people.",
+               "For what share of the people still subscribed we could check activity. Low = do not trust the activity columns.",
+               "Share of checked people who were in Telegram within the last 7 days. Meaningless for cohorts under 7 days old.",
+               "Same for 30 days."],
+        rules=[dict(formula='=OR($G2="%s",$G2="%s")' % (Q_LOW, Q_EARLY), c0=0, c1=13, fg=GREY),
+               dict(formula='=AND($G2="%s",ISNUMBER($F2),$F2>0)' % Q_OK, c0=5, c1=6, bg=GREEN),
+               dict(formula='=AND($G2="%s",ISNUMBER($F2),$F2<0)' % Q_OK, c0=5, c1=6, bg=RED)])
 
 
 def _view_howto():
@@ -652,9 +613,6 @@ async def run(channel_ids, db_path, label_fn, export_fn) -> str:
     ch_rows, src_rows, coh_rows = await asyncio.to_thread(build_rows, db_path, day, label_fn, set(channel_ids))
     await export_fn(howto_rows(), tab=HOWTO_TAB, header=["How to read this file"], replace_all=True,
                     view=_view_howto())
-    ow, nw = summary_weeks()
-    await export_fn(build_summary(coh_rows), tab=SUMMARY_TAB, header=summary_header(ow, nw), replace_all=True,
-                    view=_view_summary())
     await export_fn(coh_rows, tab=COHORT_TAB, header=COHORT_HEADER, replace_all=True, view=_view_cohorts())
     await export_fn(ch_rows, tab=CHANNEL_TAB, header=CHANNEL_HEADER, replace_date=day,
                     view=_view_plain(CHANNEL_HEADER))

@@ -46,6 +46,7 @@ Env-переменные (Railway -> Variables):
 """
 
 import asyncio
+import threading
 import json
 import logging
 import os
@@ -240,7 +241,15 @@ async def post_to_slack(text: str):
 
 
 # ---------- Google Sheets ----------
-def _sheets_append_sync(tab: str, header: list[str], rows: list[list],
+_SHEETS_LOCK = threading.Lock()  # две записи в один файл одновременно давали дубли строк
+
+
+def _sheets_append_sync(*a, **kw):
+    with _SHEETS_LOCK:
+        return _sheets_append_sync_unlocked(*a, **kw)
+
+
+def _sheets_append_sync_unlocked(tab: str, header: list[str], rows: list[list],
                         replace_date: str | None = None, replace_all: bool = False,
                         view: dict | None = None):
     import gspread
@@ -286,6 +295,24 @@ def _sheets_append_sync(tab: str, header: list[str], rows: list[list],
             log.info("Sheets [%s]: replaced %d existing row(s) for %s",
                      tab, len(idx), replace_date)
     ws.append_rows(rows, value_input_option="RAW")
+    if replace_date:
+        # страховка от гонки (два процесса при деплое): убрать полностью совпадающие строки этой даты
+        try:
+            vals = ws.get_all_values()
+            seen, dup = set(), []
+            for i, r in enumerate(vals):
+                if i == 0 or not r or r[0] != replace_date:
+                    continue
+                key = tuple(r)
+                if key in seen:
+                    dup.append(i + 1)
+                seen.add(key)
+            for i in reversed(dup):
+                ws.delete_rows(i)
+            if dup:
+                log.info("Sheets [%s]: removed %d duplicate row(s) for %s", tab, len(dup), replace_date)
+        except Exception as e:
+            log.warning("Sheets [%s]: dedupe failed: %r", tab, e)
     if view:
         try:
             import tg_sheets_format
@@ -465,6 +492,7 @@ async def run_daily_report(report_date=None):
     rows = stats_between(start_local.astimezone(timezone.utc),
                          end_local.astimezone(timezone.utc))
     date_str = report_date.isoformat()
+    await resolve_channel_titles()  # добрать названия каналов, которые не определились при старте
     counts = await get_member_counts()
 
     if report_date == now_local.date():
@@ -499,6 +527,30 @@ async def run_daily_report(report_date=None):
         await export_to_sheets(member_rows, tab="Members",
                                header=["date", "channel", "members"],
                                replace_date=snapshot_date)
+
+
+async def export_day_to_sheets(report_date):
+    """Только запись в Google Sheets за день (без Slack). Идемпотентна: строки дня заменяются."""
+    start_local = datetime.combine(report_date, datetime.min.time(), tzinfo=REPORT_TZ)
+    rows = stats_between(start_local.astimezone(timezone.utc),
+                         (start_local + timedelta(days=1)).astimezone(timezone.utc))
+    if rows:
+        await export_to_sheets(
+            [[report_date.isoformat(), chan_label(r["chat_id"]), r["link_name"],
+              r["joins"] or 0, r["leaves"] or 0, (r["joins"] or 0) - (r["leaves"] or 0),
+              r["requests"] or 0] for r in rows],
+            replace_date=report_date.isoformat())
+
+
+async def sheets_catchup(days: int = 3):
+    """При старте дописывает в таблицу последние дни: если отчёт не отработал (рестарт в час отчёта)."""
+    await asyncio.sleep(30)
+    today = datetime.now(REPORT_TZ).date()
+    for n in range(1, days + 1):
+        try:
+            await export_day_to_sheets(today - timedelta(days=n))
+        except Exception as e:
+            log.warning("Sheets catch-up %s failed: %r", n, e)
 
 
 async def build_period_report(days: int) -> str:
@@ -1147,6 +1199,8 @@ async def cmd_sheets_test(msg: Message):
 
 async def resolve_channel_titles():
     for cid in CHANNEL_IDS:
+        if cid in CHANNEL_TITLES:
+            continue
         try:
             chat = await bot.get_chat(cid)
             CHANNEL_TITLES[cid] = chat.title or str(cid)
@@ -1177,6 +1231,7 @@ async def main():
     log.info("Bot started. Channels: %s. DB: %s",
              ", ".join(chan_label(c) for c in CHANNEL_IDS), DB_PATH)
     asyncio.create_task(daily_report_scheduler())
+    asyncio.create_task(sheets_catchup())
     if EVENING_HOUR >= 0:
         asyncio.create_task(evening_report_scheduler())
     if tg_activity.ENABLED:
