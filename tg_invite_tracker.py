@@ -22,6 +22,8 @@ Env-переменные (Railway -> Variables):
     REPORT_TZ               (опц.) default "Europe/Madrid"
     REPORT_HOUR             (опц.) default 9
     KEITARO_POSTBACK_URL    (опц.) шаблон с {source} и {tg_user_id}
+    MANUAL_APPROVAL_CHANNELS (опц.) chat_id через запятую: каналы, где заявки одобряют люди.
+                            Бот там заявки не одобряет, а /newlink создаёт ссылку с заявкой
     DB_PATH                 (опц.) default "tg_tracker.db"
                             !! на Railway укажи путь на volume, напр. /data/tg_tracker.db
 
@@ -56,6 +58,7 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import ChatJoinRequest, ChatMemberUpdated, Message
 
@@ -95,6 +98,11 @@ ALERT_SPIKE_MULT = float(os.environ.get("ALERT_SPIKE_MULT", "2.0"))
 
 DB_PATH = os.environ.get("DB_PATH", "tg_tracker.db")
 AUTO_APPROVE_JOIN_REQUESTS = os.environ.get("AUTO_APPROVE", "1") == "1"
+# Каналы, где заявки одобряют люди, а не бот. Там: (1) бот НИКОГДА не одобряет заявки,
+# только записывает их; (2) /newlink и /newlink_req создают ссылку с заявкой на вступление.
+MANUAL_APPROVAL_CHANNELS: set[int] = {
+    int(x.strip()) for x in os.environ.get("MANUAL_APPROVAL_CHANNELS", "").split(",") if x.strip()
+}
 # ==================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -615,6 +623,8 @@ async def activity_scheduler():
         await asyncio.sleep(wait)
         try:
             await tg_activity.run(CHANNEL_IDS, DB_PATH, chan_label, export_to_sheets)
+        except tg_activity.SessionInvalid as e:
+            log.error("Activity snapshot skipped: %s", e)
         except Exception as e:
             log.exception("Activity snapshot failed: %s", e)
 
@@ -625,6 +635,8 @@ async def activity_scan_scheduler():
     while True:
         try:
             await tg_activity.scan_only(CHANNEL_IDS, DB_PATH, chan_label)
+        except tg_activity.SessionInvalid as e:
+            log.error("Activity scan skipped: %s", e)
         except Exception as e:
             log.exception("Activity scan failed: %s", e)
         await asyncio.sleep(tg_activity.SCAN_HOURS * 3600)
@@ -749,6 +761,10 @@ async def on_join_request(req: ChatJoinRequest):
     canonical, name = resolve_link(raw)
     log_event(req.chat.id, "request", req.from_user.id, req.from_user.username,
               canonical, name)
+    if req.chat.id in MANUAL_APPROVAL_CHANNELS:
+        log.info("Join request %s via %s in %s left for manual approval",
+                 req.from_user.id, name, chan_label(req.chat.id))
+        return
     if AUTO_APPROVE_JOIN_REQUESTS:
         try:
             await req.approve()
@@ -778,14 +794,25 @@ async def _create_link(msg: Message, is_request: bool):
         await msg.answer("Couldn't resolve the target channel. "
                          "Pass its chat_id — see /channels")
         return
-    link = await bot.create_chat_invite_link(chat_id, name=name,
-                                             creates_join_request=is_request)
+    manual = chat_id in MANUAL_APPROVAL_CHANNELS
+    is_request = is_request or manual  # в каналах с ручным одобрением вход только по заявке
+    try:
+        link = await bot.create_chat_invite_link(chat_id, name=name,
+                                                 creates_join_request=is_request)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        log.warning("create_chat_invite_link failed in %s: %s", chan_label(chat_id), e)
+        await msg.answer(
+            f"❌ Couldn't create a link in {chan_label(chat_id)}: {e.message}\n"
+            f"The bot must be an admin of this channel with the \"Add Subscribers\" "
+            f"(invite users via link) right.")
+        return
     with db() as conn:
         conn.execute("INSERT OR REPLACE INTO links VALUES (?, ?, ?, ?, ?)",
                      (link.invite_link, chat_id, name, int(is_request),
                       datetime.now(timezone.utc).isoformat()))
     kind = "Join-request link" if is_request else "Link"
-    await msg.answer(f"{kind} \"{name}\" for {chan_label(chat_id)}:\n{link.invite_link}")
+    note = "\nPeople join only after manual approval; the bot doesn't approve anyone here." if manual else ""
+    await msg.answer(f"{kind} \"{name}\" for {chan_label(chat_id)}:\n{link.invite_link}{note}")
 
 
 @dp.message(Command("newlink"))
@@ -1052,7 +1079,7 @@ async def cmd_audit(msg: Message):
 HELP_TEXT = """Available commands:
 
 Links
-/newlink name [chat_id] — create a tracked invite link
+/newlink name [chat_id] — create a tracked invite link (in manual-approval channels: join-request link, bot never approves)
 /newlink_req name [chat_id] — same, but with join request (auto-approve, filters bots)
 /addlink name https://t.me/+xxx [chat_id] — register an existing manual link under a name
 /links — list all registered links per channel

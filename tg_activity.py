@@ -30,6 +30,7 @@ Env (если не заданы API_ID / API_HASH / SESSION_STRING — моду�
     ACTIVITY_WINDOW_DAYS    в Activity Sources учитывать вступивших за последние N дней, 0 = за всё время
 """
 import asyncio
+import contextlib
 import logging
 import os
 import sqlite3
@@ -579,12 +580,32 @@ def _new_client():
     return TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
 
 
+class SessionInvalid(RuntimeError):
+    """SESSION_STRING больше не авторизован (сессию завершили или аккаунт разлогинен)."""
+
+
+@contextlib.asynccontextmanager
+async def _authorized_client():
+    """Подключается БЕЗ интерактивного start(): если сессия мёртвая, Telethon иначе
+    просит номер телефона через input() и падает с EOFError на сервере."""
+    client = _new_client()
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            raise SessionInvalid(
+                "SESSION_STRING недействителен (сессию завершили или аккаунт разлогинен). "
+                "Сгенерируйте новую: python activity_login.py, обновите SESSION_STRING в Railway.")
+        yield client
+    finally:
+        await client.disconnect()
+
+
 async def scan_only(channel_ids, db_path, label_fn) -> str:
     """Лёгкий запуск несколько раз в день: пополняет базу людьми из окон каналов."""
     if not ENABLED:
         return "Активность выключена."
     async with _get_lock():
-        async with _new_client() as client:
+        async with _authorized_client() as client:
             await client.get_dialogs()  # прогреть кэш сущностей
             done, failed = await _scan(client, sorted(channel_ids), db_path, label_fn)
     log.info("Activity scan: ok=%d failed=%d", len(done), len(failed))
@@ -598,7 +619,7 @@ async def run(channel_ids, db_path, label_fn, export_fn) -> str:
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     started = int(time.time())
     async with _get_lock():
-        async with _new_client() as client:
+        async with _authorized_client() as client:
             await client.get_dialogs()
             done, failed = await _scan(client, sorted(channel_ids), db_path, label_fn)
             conn = sqlite3.connect(db_path)
